@@ -1,0 +1,119 @@
+pkgs <- c("data.table")
+new  <- pkgs[!(pkgs %in% rownames(installed.packages()))]
+if (length(new)) install.packages(new, quiet = TRUE)
+library(data.table)
+
+DATA_DIR <- "~/Downloads/nfl-big-data-bowl-2026-prediction"
+DT <- 0.1
+
+test_input <- fread(file.path(DATA_DIR, "test_input.csv"))
+test_tpl   <- fread(file.path(DATA_DIR, "test.csv"))
+if (!"id" %in% names(test_tpl)) {
+  test_tpl[, `:=`(
+    game_id  = as.integer(game_id),
+    play_id  = as.integer(play_id),
+    nfl_id   = as.integer(nfl_id),
+    frame_id = as.integer(frame_id)
+  )]
+  test_tpl[, id := paste(game_id, play_id, nfl_id, frame_id, sep = "_")]
+}
+
+setorder(test_input, game_id, play_id, nfl_id, frame_id)
+last_row <- test_input[, .SD[.N],   by = .(game_id, play_id, nfl_id)]
+prev_row <- test_input[, .SD[.N-1], by = .(game_id, play_id, nfl_id)]
+setnames(last_row, c("frame_id","x","y"), c("last_frame_id","x_last","y_last"))
+setnames(prev_row, c("frame_id","x","y"), c("prev_frame_id","x_prev","y_prev"))
+prev_row <- prev_row[!is.na(prev_frame_id)]
+
+k <- c("game_id","play_id","nfl_id")
+last2 <- merge(last_row, prev_row, by = k, all.x = TRUE, sort = FALSE)
+last2[, df := pmax(1L, as.integer(last_frame_id) - as.integer(prev_frame_id))]
+last2[, dt := as.numeric(df) * DT]
+last2[, vx := fifelse(!is.na(x_prev) & dt > 0, (x_last - x_prev) / dt, 0)]
+last2[, vy := fifelse(!is.na(y_prev) & dt > 0, (y_last - y_prev) / dt, 0)]
+last2[, `:=`(vx = fcoalesce(vx, 0), vy = fcoalesce(vy, 0))]
+
+te <- merge(
+  test_tpl[, .(id, game_id, play_id, nfl_id, frame_id)],
+  last2,
+  by = k, all.x = TRUE, sort = FALSE
+)
+
+if (median(te$frame_id, na.rm = TRUE) < median(te$last_frame_id, na.rm = TRUE)) {
+  te[, delta_frames := pmax(0L, as.integer(frame_id))]
+} else {
+  te[, delta_frames := pmax(0L, as.integer(frame_id) - as.integer(last_frame_id))]
+}
+te[, delta_t := as.numeric(delta_frames) * DT]
+
+FIELD_X_MIN <- 0.0; FIELD_X_MAX <- 120.0
+FIELD_Y_MIN <- 0.0; FIELD_Y_MAX <- 53.3
+
+te[, x := fifelse(!is.na(x_last),
+                  pmin(pmax(x_last + vx * delta_t, FIELD_X_MIN), FIELD_X_MAX), 0)]
+te[, y := fifelse(!is.na(y_last),
+                  pmin(pmax(y_last + vy * delta_t, FIELD_Y_MIN), FIELD_Y_MAX), 0)]
+
+sub <- te[match(test_tpl$id, te$id), .(id, x, y)]
+fwrite(sub, "submission.csv")
+
+test <- fread(file.path(DATA_DIR, "test.csv"))
+if (!"id" %in% names(test)) {
+  test[, `:=`(
+    game_id  = as.integer(game_id),
+    play_id  = as.integer(play_id),
+    nfl_id   = as.integer(nfl_id),
+    frame_id = as.integer(frame_id)
+  )]
+  test[, id := paste(game_id, play_id, nfl_id, frame_id, sep = "_")]
+}
+test[, id := as.character(trimws(id))]
+sub  <- fread("submission.csv")[, id := as.character(trimws(id))]
+sub  <- sub[, .(id, x = as.numeric(x), y = as.numeric(y))]
+sub2 <- merge(test[, .(id)], sub, by = "id", all.x = TRUE, sort = FALSE)
+
+stopifnot(
+  identical(names(sub2), c("id","x","y")),
+  nrow(sub2) == nrow(test),
+  identical(sub2$id, test$id),
+  all(is.finite(sub2$x)) && all(is.finite(sub2$y)),
+  all(sub2$x >= 0 & sub2$x <= 120),
+  all(sub2$y >= 0 & sub2$y <= 53.3)
+)
+
+fwrite(sub2, "submission.csv")
+
+rmse2d <- function(px, py, tx, ty) sqrt(0.5 * (mean((px - tx)^2) + mean((py - ty)^2)))
+
+score_weeks <- function(weeks = 1:2, data_dir = DATA_DIR, dt = DT) {
+  out_scores <- numeric()
+  for (w in weeks) {
+    fin <- file.path(data_dir, "train", sprintf("input_2023_w%02d.csv", w))
+    fout <- file.path(data_dir, "train", sprintf("output_2023_w%02d.csv", w))
+    inp <- fread(fin); out <- fread(fout)
+    setorder(inp, game_id, play_id, nfl_id, frame_id)
+    last_row <- inp[, .SD[.N],   by = .(game_id, play_id, nfl_id)]
+    prev_row <- inp[, .SD[.N-1], by = .(game_id, play_id, nfl_id)]
+    setnames(last_row, c("frame_id","x","y"), c("last_frame_id","x_last","y_last"))
+    setnames(prev_row, c("frame_id","x","y"), c("prev_frame_id","x_prev","y_prev"))
+    prev_row <- prev_row[!is.na(prev_frame_id)]
+    k <- c("game_id","play_id","nfl_id")
+    l2 <- merge(last_row, prev_row, by = k, all.x = TRUE, sort = FALSE)
+    l2[, df := pmax(1L, as.integer(last_frame_id) - as.integer(prev_frame_id))]
+    l2[, dt := as.numeric(df) * dt]
+    l2[, vx := fifelse(!is.na(x_prev) & dt > 0, (x_last - x_prev) / dt, 0)]
+    l2[, vy := fifelse(!is.na(y_prev) & dt > 0, (y_last - y_prev) / dt, 0)]
+    l2[, `:=`(vx = fcoalesce(vx, 0), vy = fcoalesce(vy, 0))]
+    m <- merge(out, l2, by = k, all.x = TRUE, sort = FALSE)
+    m[, delta_frames := pmax(0L, as.integer(frame_id))]
+    m[, delta_t := as.numeric(delta_frames) * dt]
+    m[, px := pmin(pmax(x_last + vx * delta_t, 0), 120)]
+    m[, py := pmin(pmax(y_last + vy * delta_t, 0), 53.3)]
+    out_scores <- c(out_scores, rmse2d(m$px, m$py, m$x, m$y))
+  }
+  print(setNames(out_scores, sprintf("week_%02d", weeks)))
+  cat(sprintf("Mean RMSE over weeks %s: %.5f\n", paste(weeks, collapse=","), mean(out_scores)))
+  invisible(out_scores)
+}
+
+score_weeks(1:2)
