@@ -1,0 +1,204 @@
+library(tidyverse)
+library(ggimage)
+library(scales)
+library(cfbfastR)
+library(cfbplotR)
+library(pacman)
+library(data.table)
+library(randomForest)
+
+# Load csv's
+test_csv <- read_csv("test.csv")
+test_input_csv_csv <- read_csv("test_input.csv")
+sample_submission_csv <- read_csv("sample_submission.csv")
+
+# Load input and output CSVs automatically instead of one by one
+load_weekly_data <- function(type, weeks = 1:18) {
+  files <- sprintf("train/%s_2023_w%02d.csv", type, weeks)
+  names(files) <- paste0(type, "_2023_w", sprintf("%02d", weeks))
+  map_dfr(files, read_csv, .id = "source")
+}
+
+inputs <- load_weekly_data("input")
+outputs <- load_weekly_data("output")
+
+# --- Set constants ---
+DATA_DIR <- "~/Downloads/nfl-big-data-bowl-2026-prediction"
+DT <- 0.1
+FIELD_X_MIN <- 0.0
+FIELD_X_MAX <- 120.0
+FIELD_Y_MIN <- 0.0
+FIELD_Y_MAX <- 53.3
+
+# --- Create ID column if missing ---
+if (!"id" %in% names(test_csv)) {
+  test_csv <- test_csv |>
+    mutate(
+      game_id  = as.integer(game_id),
+      play_id  = as.integer(play_id),
+      nfl_id   = as.integer(nfl_id),
+      frame_id = as.integer(frame_id),
+      id = paste(game_id, play_id, nfl_id, frame_id, sep = "_")
+    )
+}
+
+# --- Compute velocities (vx, vy) using previous frame values ---
+test_input_csv <- test_input_csv |>
+  arrange(game_id, play_id, nfl_id, frame_id) |>
+  group_by(game_id, play_id, nfl_id) |>
+  mutate(
+    x_prev = lag(x),
+    y_prev = lag(y),
+    frame_prev = lag(frame_id),
+    df = pmax(1L, frame_id - frame_prev),
+    dt = df * DT,
+    vx = if_else(!is.na(x_prev) & dt > 0, (x - x_prev) / dt, 0),
+    vy = if_else(!is.na(y_prev) & dt > 0, (y - y_prev) / dt, 0)
+  ) |>
+  ungroup()
+
+# --- Get last frame per player ---
+last_frame <- test_input_csv |>
+  group_by(game_id, play_id, nfl_id) |>
+  slice_tail(n = 1) |>
+  rename(
+    last_frame_id = frame_id,
+    x_last = x,
+    y_last = y
+  )
+
+# --- Merge velocity and last position with test data ---
+median_check <- median(test_csv$frame_id, na.rm = TRUE) < median(last_frame$last_frame_id, na.rm = TRUE)
+
+te <- test_csv |>
+  left_join(last_frame, by = c("game_id", "play_id", "nfl_id")) |>
+  mutate(
+    delta_frames = if (median_check) {
+      pmax(0L, frame_id)
+    } else {
+      pmax(0L, frame_id - last_frame_id)
+    },
+    delta_t = delta_frames * DT,
+    x = if_else(!is.na(x_last),
+                pmin(pmax(x_last + vx * delta_t, FIELD_X_MIN), FIELD_X_MAX), 0),
+    y = if_else(!is.na(y_last),
+                pmin(pmax(y_last + vy * delta_t, FIELD_Y_MIN), FIELD_Y_MAX), 0)
+  )
+
+
+# --- Save submission ---
+submission <- te |>
+  select(id, x, y)
+
+write_csv(submission, "submission.csv")
+
+# --- RMSE function ---
+rmse2d <- function(px, py, tx, ty) {
+  sqrt(0.5 * (mean((px - tx)^2) + mean((py - ty)^2)))
+}
+
+# --- Scoring function ---
+score_weeks <- function(
+    weeks = 1:2,
+    data_dir = "~/Documents/Big Data Bowl 2026",  # <--- UPDATED PATH HERE
+    dt = DT
+) {
+  out_scores <- purrr::map_dbl(weeks, function(w) {
+    input_file <- file.path(data_dir, "train", sprintf("input_2023_w%02d.csv", w))
+    output_file <- file.path(data_dir, "train", sprintf("output_2023_w%02d.csv", w))
+    
+    inp <- readr::read_csv(input_file)
+    out <- readr::read_csv(output_file)
+    
+    inp <- inp |>
+      dplyr::arrange(game_id, play_id, nfl_id, frame_id) |>
+      dplyr::group_by(game_id, play_id, nfl_id) |>
+      dplyr::mutate(
+        x_prev = dplyr::lag(x),
+        y_prev = dplyr::lag(y),
+        frame_prev = dplyr::lag(frame_id),
+        df = pmax(1L, frame_id - frame_prev),
+        dt = df * dt,
+        vx = if_else(!is.na(x_prev) & dt > 0, (x - x_prev) / dt, 0),
+        vy = if_else(!is.na(y_prev) & dt > 0, (y - y_prev) / dt, 0)
+      ) |>
+      dplyr::slice_tail(n = 1) |>
+      dplyr::rename(x_last = x, y_last = y, last_frame_id = frame_id) |>
+      dplyr::ungroup()
+    
+    merged <- out |>
+      dplyr::left_join(inp, by = c("game_id", "play_id", "nfl_id")) |>
+      dplyr::mutate(
+        delta_frames = pmax(0L, frame_id - last_frame_id),
+        delta_t = delta_frames * dt,
+        px = pmin(pmax(x_last + vx * delta_t, 0), 120),
+        py = pmin(pmax(y_last + vy * delta_t, 0), 53.3)
+      )
+    
+    rmse2d(merged$px, merged$py, merged$x, merged$y)
+  })
+  
+  names(out_scores) <- sprintf("week_%02d", weeks)
+  print(out_scores)
+  cat(sprintf("Mean RMSE: %.5f\n", mean(out_scores)))
+  invisible(out_scores)
+}
+
+
+# --- Run scoring on first two weeks ---
+score_weeks(1:2)
+
+
+## RANDOM FOREST
+# --- Constants ---
+DT <- 0.1
+
+# --- Compute velocities for all players ---
+inputs <- inputs |>
+  arrange(game_id, play_id, nfl_id, frame_id) |>
+  group_by(game_id, play_id, nfl_id) |>
+  mutate(
+    x_prev = lag(x),
+    y_prev = lag(y),
+    frame_prev = lag(frame_id),
+    df = pmax(1L, frame_id - frame_prev),
+    dt = df * DT,
+    vx = if_else(!is.na(x_prev) & dt > 0, (x - x_prev) / dt, 0),
+    vy = if_else(!is.na(y_prev) & dt > 0, (y - y_prev) / dt, 0)
+  ) |>
+  ungroup()
+
+# --- Merge last observed frame per player with outputs ---
+train_all <- outputs |>
+  left_join(
+    inputs |>
+      group_by(game_id, play_id, nfl_id) |>
+      slice_tail(n = 1) |> # last frame per player
+      rename(x_last = x, y_last = y) |>
+      select(game_id, play_id, nfl_id, x_last, y_last, vx, vy),
+    by = c("game_id", "play_id", "nfl_id")
+  ) |>
+  mutate(delta_t = 0.1)  # predicting one frame ahead
+
+# --- Features and targets ---
+features <- train_all |> select(x_last, y_last, vx, vy, delta_t)
+target_x <- train_all$x
+target_y <- train_all$y
+
+# --- Train Random Forest models ---
+set.seed(123)
+rf_x <- randomForest(features, target_x, ntree = 200)
+rf_y <- randomForest(features, target_y, ntree = 200)
+
+# --- Predict on training data to check performance ---
+pred_x <- predict(rf_x, features)
+pred_y <- predict(rf_y, features)
+
+# --- RMSE function ---
+rmse2d <- function(px, py, tx, ty) {
+  sqrt(0.5 * (mean((px - tx)^2) + mean((py - ty)^2)))
+}
+
+# --- Evaluate model ---
+rmse2d(pred_x, pred_y, train_all$x, train_all$y)
+
