@@ -1,0 +1,580 @@
+# ================================================================
+# NFL Big Data Bowl 2026 — Physics + Residual XGBoost (Huber)
+# End-to-end R pipeline (data.table + xgboost)
+# ================================================================
+
+# ---- packages ----
+pkgs <- c("data.table","xgboost")
+new  <- pkgs[!(pkgs %in% rownames(installed.packages()))]
+if (length(new)) install.packages(new, quiet = TRUE)
+lapply(pkgs, library, character.only = TRUE)
+
+# ---- config ----
+DATA_DIR <- "~/Downloads/nfl-big-data-bowl-2026-prediction"  # <== change if needed
+DT       <- 0.1                                              # frame interval (sec)
+FIELD_X_MIN <- 0.0; FIELD_X_MAX <- 120.0
+FIELD_Y_MIN <- 0.0; FIELD_Y_MAX <- 53.3
+
+# ================================================================
+# Utility helpers
+# ================================================================
+clip_num <- function(x, lo, hi) pmin(pmax(x, lo), hi)
+
+rmse2d <- function(px, py, tx, ty) {
+  sqrt(0.5 * (mean((px - tx)^2) + mean((py - ty)^2)))
+}
+
+ensure_cols <- function(DTcols, want) {
+  missing <- setdiff(want, names(DTcols))
+  if (length(missing)) DTcols[, (missing) := 0]
+  setcolorder(DTcols, want)
+  DTcols
+}
+
+# Rolling SD shim (works on older data.table)
+roll_sd <- function(x, n, align = "right") {
+  data.table::frollapply(x, n = n, align = align, FUN = function(z) stats::sd(z))
+}
+
+# ================================================================
+# Kinematics extraction (from raw tracking)
+# ================================================================
+ensure_vel_cols <- function(dt, DT = DT) {
+  need_vx <- !"vx" %in% names(dt)
+  need_vy <- !"vy" %in% names(dt)
+  if (!need_vx && !need_vy) return(dt)
+  s   <- if ("s"   %in% names(dt)) dt$s   else 0
+  a   <- if ("a"   %in% names(dt)) dt$a   else 0
+  dir <- if ("dir" %in% names(dt)) dt$dir else 0
+  dir_rad <- as.numeric(dir) * pi/180
+  v_inst  <- s + 0.5 * a * DT
+  if (need_vx) dt[, vx := as.numeric(v_inst) * sin(dir_rad)]
+  if (need_vy) dt[, vy := as.numeric(v_inst) * cos(dir_rad)]
+  dt[!is.finite(vx), vx := 0]
+  dt[!is.finite(vy), vy := 0]
+  dt
+}
+
+add_roll_feats <- function(dt, windows = c(3L,5L,10L)) {
+  dt <- ensure_vel_cols(copy(dt))
+  setorder(dt, game_id, play_id, nfl_id, frame_id)
+  byk  <- c("game_id","play_id","nfl_id")
+  cols <- intersect(c("vx","vy","s","a"), names(dt))
+  for (w in windows) for (c in cols) {
+    rn <- paste0(c,"_roll", w)
+    rs <- paste0(c,"_std",  w)
+    dt[, (rn) := data.table::frollmean(get(c), n = w, align = "right"), by = byk]
+    dt[, (rs) := roll_sd(get(c),               n = w, align = "right"), by = byk]
+    dt[!is.finite(get(rn)), (rn) := 0]
+    dt[!is.finite(get(rs)), (rs) := 0]
+  }
+  dt
+}
+
+add_lags_ema <- function(dt) {
+  dt <- ensure_vel_cols(copy(dt))
+  setorder(dt, game_id, play_id, nfl_id, frame_id)
+  byk <- c("game_id","play_id","nfl_id")
+  for (lag in 4:5) {
+    dt[, paste0("x_lag",lag)  := shift(x,  lag), by=byk]
+    dt[, paste0("y_lag",lag)  := shift(y,  lag), by=byk]
+    dt[, paste0("vx_lag",lag) := shift(vx, lag), by=byk]
+    dt[, paste0("vy_lag",lag) := shift(vy, lag), by=byk]
+  }
+  alpha <- 0.3
+  dt[, vx_ema := Reduce(function(p,cur) alpha*cur + (1-alpha)*p, vx, accumulate=TRUE), by=byk]
+  dt[, vy_ema := Reduce(function(p,cur) alpha*cur + (1-alpha)*p, vy, accumulate=TRUE), by=byk]
+  dt[, c("vx_ema","vy_ema") := lapply(.SD, function(z) fifelse(is.finite(z), z, 0)), .SDcols=c("vx_ema","vy_ema")]
+  dt
+}
+
+add_ball_feats <- function(dt) {
+  if (!all(c("ball_land_x","ball_land_y") %in% names(dt))) return(dt)
+  dx <- dt$ball_land_x - dt$x
+  dy <- dt$ball_land_y - dt$y
+  dist <- sqrt(dx^2 + dy^2)
+  dt[, ball_dir_x := fifelse(dist>0, dx/dist, 0)]
+  dt[, ball_dir_y := fifelse(dist>0, dy/dist, 0)]
+  if (all(c("vx","vy") %in% names(dt))) {
+    dt[, vel_align := vx*ball_dir_x + vy*ball_dir_y]
+    dt[, vel_perp  := vx*(-ball_dir_y) + vy*ball_dir_x]
+  }
+  dt[, dist_ball := dist]
+  dt
+}
+
+# ================================================================
+# Last-frame motion params per player
+# ================================================================
+motion_params <- function(df, K=5L, speed_cap=11.8, accel_cap=10.0, alpha_dir=0.7) {
+  # Assumes df is a per-(game_id,play_id,nfl_id) table ordered by frame_id
+  setorder(df, frame_id)
+  # last and previous row
+  last <- df[.N]
+  prev <- if (.N >= 2L) df[.N-1L] else last
+  # components
+  df <- ensure_vel_cols(df)
+  # Savitzky-Golay-ish KNN smoothing via rolling means
+  kk <- as.integer(pmax(1L, K))
+  vx_s <- zoo::rollmean(df$vx, kk, align="right", fill=tail(df$vx,1))
+  vy_s <- zoo::rollmean(df$vy, kk, align="right", fill=tail(df$vy,1))
+  ax_s <- c(0, diff(vx_s))/DT
+  ay_s <- c(0, diff(vy_s))/DT
+  vx <- tail(vx_s,1); vy <- tail(vy_s,1)
+  ax <- tail(ax_s,1); ay <- tail(ay_s,1)
+  # caps
+  vmag <- sqrt(vx^2 + vy^2)
+  if (is.finite(vmag) && vmag > speed_cap) {
+    sc <- speed_cap / vmag
+    vx <- vx * sc; vy <- vy * sc
+  }
+  amag <- sqrt(ax^2 + ay^2)
+  if (is.finite(amag) && amag > accel_cap) {
+    sc <- accel_cap / amag
+    ax <- ax * sc; ay <- ay * sc
+  }
+  theta <- atan2(vy, vx)
+  # emit
+  data.table(
+    game_id = last$game_id, play_id = last$play_id, nfl_id = last$nfl_id,
+    last_frame_id = last$frame_id,
+    x_last = last$x, y_last = last$y,
+    vx = vx, vy = vy, ax = ax, ay = ay, theta = theta
+  )
+}
+
+# ================================================================
+# Physics predictors
+# ================================================================
+pred_CVa <- function(x0, y0, vx, vy, ax, ay, dt) {
+  x <- x0 + vx*dt + 0.5*ax*dt^2
+  y <- y0 + vy*dt + 0.5*ay*dt^2
+  list(x = x, y = y)
+}
+
+pred_CTRV <- function(x0, y0, theta, v, omega, dt) {
+  n <- length(x0); x <- numeric(n); y <- numeric(n)
+  straight <- !is.finite(omega) | abs(omega) < 1e-4
+  s <- which(straight)
+  if (length(s)) {
+    x[s] <- x0[s] + v[s]*cos(theta[s])*dt[s]
+    y[s] <- y0[s] + v[s]*sin(theta[s])*dt[s]
+  }
+  t <- which(!straight & is.finite(v) & is.finite(theta) & is.finite(dt))
+  if (length(t)) {
+    R <- v[t] / omega[t]
+    x[t] <- x0[t] + R * (sin(theta[t] + omega[t]*dt[t]) - sin(theta[t]))
+    y[t] <- y0[t] - R * (cos(theta[t] + omega[t]*dt[t]) - cos(theta[t]))
+  }
+  list(x = x, y = y)
+}
+
+pred_DIRBLEND <- function(x0, y0, theta, v, dt, steer = 0.3) {
+  n <- length(x0); x <- numeric(n); y <- numeric(n)
+  has_theta <- is.finite(theta)
+  h <- which(has_theta); nh <- which(!has_theta)
+  if (length(h)) {
+    vx <- v[h] * cos(theta[h]); vy <- v[h] * sin(theta[h])
+    x[h] <- x0[h] + vx * dt[h]; y[h] <- y0[h] + vy * dt[h]
+  }
+  if (length(nh)) { x[nh] <- x0[nh]; y[nh] <- y0[nh] }
+  list(x = x, y = y)
+}
+
+# ================================================================
+# Neighbor features (last observed frame)
+# ================================================================
+get_team_col <- function(dt) {
+  cand <- c("team","club","team_abbr","club_code","player_side")
+  nm <- names(dt); col <- cand[cand %in% nm]
+  if (length(col)) col[1] else NULL
+}
+
+neighbor_feats <- function(last_frame_dt, k=3) {
+  team_col <- get_team_col(last_frame_dt)
+  dt <- copy(last_frame_dt); setnames(dt, c("x","y"), c("x0","y0"))
+  out <- dt[, {
+    pool <- last_frame_dt[game_id == .BY$game_id & play_id == .BY$play_id]
+    if (!is.null(team_col)) {
+      team_cur <- pool[nfl_id == .BY$nfl_id, get(team_col)][1]
+      pool <- pool[get(team_col) != team_cur]
+    }
+    pool <- pool[nfl_id != .BY$nfl_id]
+    if (nrow(pool) == 0L) {
+      list(d1=Inf,d2=Inf,d3=Inf, mean3=Inf, min3=Inf,
+           opp_id=NA_integer_, opp_x=NA_real_, opp_y=NA_real_)
+    } else {
+      d  <- sqrt((x0 - pool$x)^2 + (y0 - pool$y)^2)
+      ds <- sort(d); ds <- c(ds, rep(Inf, max(0, k - length(ds))))
+      i  <- which.min(d)
+      list(d1=ds[1], d2=ds[2], d3=ds[3],
+           mean3=mean(ds[1:3]), min3=min(ds[1:3]),
+           opp_id = pool$nfl_id[i], opp_x = pool$x[i], opp_y = pool$y[i])
+    }
+  }, by = .(game_id, play_id, nfl_id, x0, y0)]
+  setnames(out, c("x0","y0"), c("x_last_nf","y_last_nf"))
+  out[]
+}
+
+# ================================================================
+# Feature builder for the residual model
+# ================================================================
+make_feats <- function(df) {
+  # expects: x_last,y_last,vx,vy,ax,ay,theta,delta_t
+  df[, v := sqrt(vx^2 + vy^2)]
+  df[, omega := fifelse(is.finite(v) & v > 1e-6, (vx*ay - vy*ax) / pmax(v^2,1e-6), 0)]
+  df[, dist_left  := y_last - 0.0]
+  df[, dist_right := 53.3 - y_last]
+  df[, x_norm := clip_num(x_last/120, 0, 1)]
+  df[, y_norm := clip_num(y_last/53.3, 0, 1)]
+  df[, sin_th := sin(theta)]
+  df[, cos_th := cos(theta)]
+  df[, dt2 := delta_t^2]
+  df[, turn_energy := abs(omega) * pmin(v, 15)]
+  df[, alat := (vx*ay - vy*ax) / pmax(v, 1e-6)]
+
+  num <- c("delta_t","dt2","v","ax","ay","omega","alat","turn_energy",
+           "x_norm","y_norm","dist_left","dist_right","sin_th","cos_th")
+  df[, (num) := lapply(.SD, function(z) fifelse(is.finite(z), z, 0)), .SDcols=num]
+  df[, ..num]
+}
+
+# ================================================================
+# Huber objective for xgboost residuals
+# ================================================================
+huber_obj <- function(preds, dtrain, delta = 0.7) {
+  y <- xgboost::getinfo(dtrain, "label")
+  r <- preds - y
+  absr <- abs(r)
+  grad <- ifelse(absr <= delta, r, delta * sign(r))
+  hess <- ifelse(absr <= delta, 1.0, 0.0)
+  list(grad = grad, hess = hess)
+}
+
+# ================================================================
+# Train-set builder (physics baseline + residual targets)
+# ================================================================
+build_train_residuals <- function(weeks = 1:6, K=5L, speed_cap=11.8, accel_cap=10.0, alpha_dir=0.7) {
+  feats <- NULL
+  for (w in weeks) {
+    fin <- file.path(DATA_DIR, "train", sprintf("input_2023_w%02d.csv", w))
+    fout <- file.path(DATA_DIR, "train", sprintf("output_2023_w%02d.csv", w))
+    inp <- fread(fin); outp <- fread(fout)
+    setorder(inp, game_id, play_id, nfl_id, frame_id)
+
+    # enrich raw input with temporal/ball features
+    inp <- add_roll_feats(inp)
+    inp <- add_lags_ema(inp)
+    inp <- add_ball_feats(inp)
+
+    # motion params per player
+    mp  <- inp[, motion_params(.SD, K=K, speed_cap=speed_cap, accel_cap=accel_cap, alpha_dir=alpha_dir),
+               by=.(game_id,play_id,nfl_id)]
+
+    # neighbor features (last frame)
+    last_tbl <- inp[, .SD[.N], by=.(game_id, play_id, nfl_id)]
+    nf <- neighbor_feats(last_tbl, k=3)
+    mp <- merge(mp, nf[, .(game_id,play_id,nfl_id,d1,d2,d3,mean3,min3,opp_id,opp_x,opp_y)],
+                by=c("game_id","play_id","nfl_id"), all.x=TRUE, sort=FALSE)
+    for (cc in c("d1","d2","d3","mean3","min3")) mp[!is.finite(get(cc)), (cc) := 100]
+
+    # attach opponent motion where available
+    opp_mp <- mp[, .(game_id, play_id, nfl_id, vx_opp = vx, vy_opp = vy, theta_opp = theta)]
+    setnames(opp_mp, "nfl_id", "opp_id")
+    mp <- merge(mp, opp_mp, by=c("game_id","play_id","opp_id"), all.x=TRUE, sort=FALSE)
+
+    # simple interactions vs nearest opponent
+    mp[, los_theta := atan2(opp_y - y_last, opp_x - x_last)]
+    mp[, heading_diff := ((theta - los_theta + pi) %% (2*pi)) - pi]
+    mp[, opp_v := sqrt(fifelse(is.finite(vx_opp), vx_opp, 0)^2 + fifelse(is.finite(vy_opp), vy_opp, 0)^2)]
+    mp[, rel_vx := vx - fifelse(is.finite(vx_opp), vx_opp, 0)]
+    mp[, rel_vy := vy - fifelse(is.finite(vy_opp), vy_opp, 0)]
+    mp[, closing_speed := rel_vx * cos(los_theta) + rel_vy * sin(los_theta)]
+    mp[, ttc := pmin(pmax(d1 / pmax(1e-3, closing_speed), 0), 1.5)]
+    for (cc in c("los_theta","heading_diff","opp_v","rel_vx","rel_vy","closing_speed","ttc"))
+      mp[!is.finite(get(cc)), (cc) := 0]
+
+    # merge with labels and compute physics baseline
+    m <- merge(outp, mp, by=c("game_id","play_id","nfl_id"), all.x=TRUE, sort=FALSE)
+    m[, delta_frames := pmax(0L, as.integer(frame_id) - as.integer(last_frame_id))]
+    m[, delta_t := as.numeric(delta_frames) * DT]
+
+    th <- m$theta; th[!is.finite(th)] <- atan2(m$vy, m$vx)
+    pr1 <- pred_CVa(m$x_last, m$y_last, m$vx, m$vy, m$ax, m$ay, m$delta_t)
+    v   <- sqrt(m$vx^2 + m$vy^2)
+    om  <- fifelse(is.finite(v) & v > 1e-4, (m$vx*m$ay - m$vy*m$ax)/pmax(v^2,1e-6), 0)
+    pr2 <- pred_CTRV(m$x_last, m$y_last, th, v, om, m$delta_t)
+    pr3 <- pred_DIRBLEND(m$x_last, m$y_last, th, v, m$delta_t, steer=0.3)
+    px  <- 0.5*pr1$x + 0.3*pr2$x + 0.2*pr3$x
+    py  <- 0.5*pr1$y + 0.3*pr2$y + 0.2*pr3$y
+
+    # base features
+    fx <- make_feats(data.table(
+      x_last=m$x_last, y_last=m$y_last, vx=m$vx, vy=m$vy, ax=m$ax, ay=m$ay,
+      theta=th, delta_t=m$delta_t
+    ))
+    # append neighbor/interaction scalars
+    fx[, `:=`(
+      d1=m$d1, d2=m$d2, d3=m$d3, dmean3=m$mean3, dmin3=m$min3,
+      los_theta=m$los_theta, heading_diff=m$heading_diff,
+      opp_v=m$opp_v, rel_vx=m$rel_vx, rel_vy=m$rel_vy,
+      closing_speed=m$closing_speed, ttc=m$ttc
+    )]
+    for (cc in c("d1","d2","d3","dmean3","dmin3","los_theta","heading_diff","opp_v",
+                 "rel_vx","rel_vy","closing_speed","ttc"))
+      fx[!is.finite(get(cc)), (cc) := 0]
+
+    block <- cbind(fx, dx = m$x - px, dy = m$y - py)
+    feats <- if (is.null(feats)) block else rbind(feats, block, fill=TRUE)
+  }
+  feats[is.na(feats)] <- 0
+  feats
+}
+
+# ================================================================
+# Fit residual models (xgboost)
+# ================================================================
+fit_residual_models <- function(train_df) {
+  X <- as.matrix(train_df[, !c("dx","dy")])
+  dx <- train_df$dx; dy <- train_df$dy
+  dmx <- xgb.DMatrix(X, label = dx)
+  dmy <- xgb.DMatrix(X, label = dy)
+  params <- list(
+    eta=0.03, max_depth=7, min_child_weight=12,
+    subsample=0.9, colsample_bytree=0.9,
+    lambda=2.0, alpha=0.3, objective="reg:squarederror" # objective ignored by custom obj
+  )
+  mx <- xgb.train(params, dmx, nrounds=650, obj=huber_obj, verbose=0)
+  my <- xgb.train(params, dmy, nrounds=650, obj=huber_obj, verbose=0)
+  list(mx=mx, my=my, feat_names=colnames(X))
+}
+
+# ================================================================
+# CV scorer using stacked model
+# ================================================================
+score_weeks_stacked <- function(weeks = 1:2, K=5L, speed_cap=11.8, accel_cap=10.0, alpha_dir=0.7, mdl=NULL) {
+  if (is.null(mdl)) stop("Pass mdl fitted by fit_residual_models.")
+  out <- c()
+  for (w in weeks) {
+    fin <- file.path(DATA_DIR, "train", sprintf("input_2023_w%02d.csv", w))
+    fout <- file.path(DATA_DIR, "train", sprintf("output_2023_w%02d.csv", w))
+    inp <- fread(fin); outp <- fread(fout)
+    setorder(inp, game_id, play_id, nfl_id, frame_id)
+
+    # enrich
+    inp <- add_roll_feats(inp)
+    inp <- add_lags_ema(inp)
+    inp <- add_ball_feats(inp)
+
+    # motion params + neighbors + interactions
+    mp  <- inp[, motion_params(.SD, K=K, speed_cap=speed_cap, accel_cap=accel_cap, alpha_dir=alpha_dir),
+               by=.(game_id,play_id,nfl_id)]
+    last_tbl <- inp[, .SD[.N], by=.(game_id, play_id, nfl_id)]
+    nf <- neighbor_feats(last_tbl, k=3)
+    mp <- merge(mp, nf[, .(game_id,play_id,nfl_id,d1,d2,d3,mean3,min3,opp_id,opp_x,opp_y)],
+                by=c("game_id","play_id","nfl_id"), all.x=TRUE, sort=FALSE)
+    for (cc in c("d1","d2","d3","mean3","min3")) mp[!is.finite(get(cc)), (cc) := 100]
+    opp_mp <- mp[, .(game_id, play_id, nfl_id, vx_opp=vx, vy_opp=vy, theta_opp=theta)]
+    setnames(opp_mp, "nfl_id", "opp_id")
+    mp <- merge(mp, opp_mp, by=c("game_id","play_id","opp_id"), all.x=TRUE, sort=FALSE)
+    mp[, los_theta := atan2(opp_y - y_last, opp_x - x_last)]
+    mp[, heading_diff := ((theta - los_theta + pi) %% (2*pi)) - pi]
+    mp[, opp_v := sqrt(fifelse(is.finite(vx_opp), vx_opp, 0)^2 + fifelse(is.finite(vy_opp), vy_opp, 0)^2)]
+    mp[, rel_vx := vx - fifelse(is.finite(vx_opp), vx_opp, 0)]
+    mp[, rel_vy := vy - fifelse(is.finite(vy_opp), vy_opp, 0)]
+    mp[, closing_speed := rel_vx * cos(los_theta) + rel_vy * sin(los_theta)]
+    mp[, ttc := pmin(pmax(d1 / pmax(1e-3, closing_speed), 0), 1.5)]
+    for (cc in c("los_theta","heading_diff","opp_v","rel_vx","rel_vy","closing_speed","ttc"))
+      mp[!is.finite(get(cc)), (cc) := 0]
+
+    m <- merge(outp, mp, by=c("game_id","play_id","nfl_id"), all.x=TRUE, sort=FALSE)
+    m[, delta_frames := pmax(0L, as.integer(frame_id) - as.integer(last_frame_id))]
+    m[, delta_t := as.numeric(delta_frames) * DT]
+
+    th <- m$theta; th[!is.finite(th)] <- atan2(m$vy, m$vx)
+    pr1 <- pred_CVa(m$x_last, m$y_last, m$vx, m$vy, m$ax, m$ay, m$delta_t)
+    v   <- sqrt(m$vx^2 + m$vy^2)
+    om  <- fifelse(is.finite(v) & v > 1e-4, (m$vx*m$ay - m$vy*m$ax)/pmax(v^2,1e-6), 0)
+    pr2 <- pred_CTRV(m$x_last, m$y_last, th, v, om, m$delta_t)
+    pr3 <- pred_DIRBLEND(m$x_last, m$y_last, th, v, m$delta_t, steer=0.3)
+    base_x <- 0.5*pr1$x + 0.3*pr2$x + 0.2*pr3$x
+    base_y <- 0.5*pr1$y + 0.3*pr2$y + 0.2*pr3$y
+
+    fx <- make_feats(data.table(
+      x_last=m$x_last, y_last=m$y_last, vx=m$vx, vy=m$vy, ax=m$ax, ay=m$ay,
+      theta=th, delta_t=m$delta_t
+    ))
+    fx[, `:=`(
+      d1=m$d1, d2=m$d2, d3=m$d3, dmean3=m$mean3, dmin3=m$min3,
+      los_theta=m$los_theta, heading_diff=m$heading_diff,
+      opp_v=m$opp_v, rel_vx=m$rel_vx, rel_vy=m$rel_vy,
+      closing_speed=m$closing_speed, ttc=m$ttc
+    )]
+    for (cc in c("d1","d2","d3","dmean3","dmin3","los_theta","heading_diff",
+                 "opp_v","rel_vx","rel_vy","closing_speed","ttc"))
+      fx[!is.finite(get(cc)), (cc) := 0]
+
+    fx <- ensure_cols(fx, mdl$feat_names)
+    X  <- as.matrix(fx)
+    dx_hat <- predict(mdl$mx, X)
+    dy_hat <- predict(mdl$my, X)
+
+    px <- clip_num(base_x + dx_hat, FIELD_X_MIN, FIELD_X_MAX)
+    py <- clip_num(base_y + dy_hat, FIELD_Y_MIN, FIELD_Y_MAX)
+
+    out <- c(out, rmse2d(px, py, m$x, m$y))
+  }
+  names(out) <- sprintf("week_%02d", weeks)
+  print(out)
+  cat(sprintf("Mean RMSE stacked weeks %s: %.5f\n", paste(weeks, collapse=","), mean(out)))
+  invisible(mean(out))
+}
+
+# ================================================================
+# Submission from stacked model
+# ================================================================
+make_submission_stacked <- function(models, K=5L, speed_cap=11.8, accel_cap=10.0, alpha_dir=0.7) {
+  test_input <- fread(file.path(DATA_DIR, "test_input.csv"))
+  test_tpl   <- fread(file.path(DATA_DIR, "test.csv"))
+  if (!"id" %in% names(test_tpl)) {
+    test_tpl[, `:=`(game_id=as.integer(game_id), play_id=as.integer(play_id),
+                    nfl_id=as.integer(nfl_id), frame_id=as.integer(frame_id))]
+    test_tpl[, id := paste(game_id, play_id, nfl_id, frame_id, sep="_")]
+  }
+  test_tpl[, id := as.character(trimws(id))]
+  setorder(test_input, game_id, play_id, nfl_id, frame_id)
+
+  # enrich
+  test_input <- add_roll_feats(test_input)
+  test_input <- add_lags_ema(test_input)
+  test_input <- add_ball_feats(test_input)
+
+  # motion params + neighbors + interactions
+  mp <- test_input[, motion_params(.SD, K, speed_cap, accel_cap, alpha_dir), by=.(game_id,play_id,nfl_id)]
+  last_tbl <- test_input[, .SD[.N], by=.(game_id, play_id, nfl_id)]
+  nf <- neighbor_feats(last_tbl, k=3)
+  mp <- merge(mp, nf[, .(game_id,play_id,nfl_id,d1,d2,d3,mean3,min3,opp_id,opp_x,opp_y)],
+              by=c("game_id","play_id","nfl_id"), all.x=TRUE, sort=FALSE)
+  for (cc in c("d1","d2","d3","mean3","min3")) mp[!is.finite(get(cc)), (cc) := 100]
+  opp_mp <- mp[, .(game_id, play_id, nfl_id, vx_opp=vx, vy_opp=vy, theta_opp=theta)]
+  setnames(opp_mp, "nfl_id", "opp_id")
+  mp <- merge(mp, opp_mp, by=c("game_id","play_id","opp_id"), all.x=TRUE, sort=FALSE)
+  mp[, los_theta := atan2(opp_y - y_last, opp_x - x_last)]
+  mp[, heading_diff := ((theta - los_theta + pi) %% (2*pi)) - pi]
+  mp[, opp_v := sqrt(fifelse(is.finite(vx_opp), vx_opp, 0)^2 + fifelse(is.finite(vy_opp), vy_opp, 0)^2)]
+  mp[, rel_vx := vx - fifelse(is.finite(vx_opp), vx_opp, 0)]
+  mp[, rel_vy := vy - fifelse(is.finite(vy_opp), vy_opp, 0)]
+  mp[, closing_speed := rel_vx * cos(los_theta) + rel_vy * sin(los_theta)]
+  mp[, ttc := pmin(pmax(d1 / pmax(1e-3, closing_speed), 0), 1.5)]
+  for (cc in c("los_theta","heading_diff","opp_v","rel_vx","rel_vy","closing_speed","ttc"))
+    mp[!is.finite(get(cc)), (cc) := 0]
+
+  te <- merge(test_tpl[, .(id,game_id,play_id,nfl_id,frame_id)], mp,
+              by=c("game_id","play_id","nfl_id"), all.x=TRUE, sort=FALSE)
+  te[, delta_frames := fifelse(!is.na(last_frame_id),
+                               pmax(0L, as.integer(frame_id) - as.integer(last_frame_id)),
+                               pmax(0L, as.integer(frame_id)))]
+  te[, delta_t := as.numeric(delta_frames) * DT]
+
+  th <- te$theta; th[!is.finite(th)] <- atan2(te$vy, te$vx)
+  pr1 <- pred_CVa(te$x_last, te$y_last, te$vx, te$vy, te$ax, te$ay, te$delta_t)
+  v   <- sqrt(te$vx^2 + te$vy^2)
+  om  <- fifelse(is.finite(v) & v > 1e-4, (te$vx*te$ay - te$vy*te$ax)/pmax(v^2,1e-6), 0)
+  pr2 <- pred_CTRV(te$x_last, te$y_last, th, v, om, te$delta_t)
+  pr3 <- pred_DIRBLEND(te$x_last, te$y_last, th, v, te$delta_t, steer=0.3)
+  base_x <- 0.5*pr1$x + 0.3*pr2$x + 0.2*pr3$x
+  base_y <- 0.5*pr1$y + 0.3*pr2$y + 0.2*pr3$y
+
+  fx <- make_feats(data.table(
+    x_last=te$x_last, y_last=te$y_last, vx=te$vx, vy=te$vy, ax=te$ax, ay=te$ay,
+    theta=th, delta_t=te$delta_t
+  ))
+  fx[, `:=`(
+    d1=te$d1, d2=te$d2, d3=te$d3, dmean3=te$mean3, dmin3=te$min3,
+    los_theta=te$los_theta, heading_diff=te$heading_diff,
+    opp_v=te$opp_v, rel_vx=te$rel_vx, rel_vy=te$rel_vy,
+    closing_speed=te$closing_speed, ttc=te$ttc
+  )]
+  for (cc in c("d1","d2","d3","dmean3","dmin3","los_theta","heading_diff",
+               "opp_v","rel_vx","rel_vy","closing_speed","ttc"))
+    fx[!is.finite(get(cc)), (cc) := 0]
+
+  fx <- ensure_cols(fx, models$feat_names)
+  X  <- as.matrix(fx)
+  dx_hat <- predict(models$mx, X)
+  dy_hat <- predict(models$my, X)
+
+  x <- clip_num(base_x + dx_hat, FIELD_X_MIN, FIELD_X_MAX)
+  y <- clip_num(base_y + dy_hat, FIELD_Y_MIN, FIELD_Y_MAX)
+
+  sub <- data.table(id=test_tpl$id, x=as.numeric(x), y=as.numeric(y))
+  stopifnot(
+    identical(sort(names(sub)), c("id","x","y")),
+    nrow(sub) == nrow(test_tpl),
+    all(is.finite(sub$x)) && all(is.finite(sub$y)),
+    all(sub$x >= FIELD_X_MIN & sub$x <= FIELD_X_MAX),
+    all(sub$y >= FIELD_Y_MIN & sub$y <= FIELD_Y_MAX)
+  )
+  fwrite(sub, "submission.csv")
+  cat("Wrote submission.csv (stacked) with", nrow(sub), "rows\n")
+}
+
+# ================================================================
+# Simple weighted blender for multiple submission.csv files
+# ================================================================
+blend_submissions <- function(files, weights = NULL, out = "submission.csv") {
+  stopifnot(length(files) >= 2)
+  subs <- lapply(files, fread)
+  ids_ok <- Reduce(function(a,b) identical(a$id,b$id), subs)
+  if (!ids_ok) {
+    # safer path: align each to competition test order
+    test <- fread(file.path(DATA_DIR, "test.csv"))
+    if (!"id" %in% names(test)) {
+      test[, `:=`(game_id=as.integer(game_id), play_id=as.integer(play_id),
+                  nfl_id=as.integer(nfl_id), frame_id=as.integer(frame_id))]
+      test[, id := paste(game_id, play_id, nfl_id, frame_id, sep="_")]
+    }
+    test[, id := as.character(trimws(id))]
+    base <- test[, .(id)]
+    for (i in seq_along(subs)) {
+      s <- subs[[i]][, .(id, x, y)]
+      s[, id := as.character(trimws(id))]
+      subs[[i]] <- merge(base, s, by="id", all.x=TRUE, sort=FALSE)
+    }
+  }
+  if (is.null(weights)) weights <- rep(1/length(subs), length(subs))
+  stopifnot(abs(sum(weights) - 1) < 1e-9)
+  ids <- subs[[1]]$id
+  X   <- do.call(cbind, lapply(subs, \(dt) dt$x))
+  Y   <- do.call(cbind, lapply(subs, \(dt) dt$y))
+  outdt <- data.table(id = ids,
+                      x = as.numeric(X %*% weights),
+                      y = as.numeric(Y %*% weights))
+  fwrite(outdt, out)
+  cat("Blended", length(files), "files →", out, "rows:", nrow(outdt), "\n")
+}
+
+# ================================================================
+# Usage (uncomment what you need)
+# ================================================================
+
+# 1) Build training features (start with 1:6 for speed, then 1:8 or more)
+# tr  <- build_train_residuals(weeks = 1:6)
+# mdl <- fit_residual_models(tr)
+
+# 2) Quick CV check
+# score_weeks_stacked(weeks = 1:2, mdl = mdl)
+# score_weeks_stacked(weeks = 1:8, mdl = mdl)
+
+# 3) Make a submission
+# make_submission_stacked(mdl, K=5)
+
+# 4) (Optional) Build a few variants and blend
+# make_submission_stacked(mdl, K=3); file.rename("submission.csv","subK3.csv")
+# make_submission_stacked(mdl, K=5); file.rename("submission.csv","subK5.csv")
+# make_submission_stacked(mdl, K=7); file.rename("submission.csv","subK7.csv")
+# blend_submissions(c("subK3.csv","subK5.csv","subK7.csv"),
+#                   weights=c(.25,.5,.25), out="submission.csv")
+
+# 5) Save models
+# saveRDS(mdl, "mdl_main.rds")
