@@ -3,6 +3,10 @@ library(ggimage)
 library(scales)
 library(nflfastR)
 library(pacman)
+library(rsample)
+library(pROC)
+library(xgboost)
+library(Matrix)
 
 # Load individual input csv's
 input_2023_w01 <- read_csv("train/input_2023_w01.csv")
@@ -127,5 +131,52 @@ closest_defender_post_throw <- closest_defender_post_throw |>
 model_data <- closest_defender_post_throw |>
   left_join(supp_data, by = c("game_id", "play_id"))
 
+# Select features (pre-throw only) and the target
+df <- model_data |> 
+  # keep only columns we will use (add more pre-throw features if useful)
+  select(game_id, play_id, defender_id, def_name,
+         # pre-throw defender features
+         def_before_pass_x, def_before_pass_y, def_s, def_a, def_dir, def_o,
+         # receiver pre-throw features (separation / relative info)
+         rec_before_pass_x, rec_before_pass_y, rec_s, rec_a, rec_dir, rec_o,
+         distance_to_receiver,
+         # play / context features (from supp_data columns already in model_data)
+         down, yards_to_go, pass_length, dropback_distance, team_coverage_type,
+         defenders_in_the_box, pass_location_type,
+         # target
+         defender_within_2yds) |> 
+  # remove rows with missing target
+  filter(!is.na(defender_within_2yds)) |> 
+  # convert target to numeric (0/1)
+  mutate(defender_within_2yds = as.integer(defender_within_2yds))
 
+set.seed(2025)
+plays <- df |> distinct(game_id, play_id)
+train_plays <- initial_split(plays, prop = 0.75)
+train_ids <- training(train_plays)
+test_ids  <- testing(train_plays)
 
+train_df <- df |> inner_join(train_ids, by = c("game_id", "play_id"))
+test_df  <- df |> inner_join(test_ids,  by = c("game_id", "play_id"))
+
+# convert categorical to factors
+train_glm <- train_df |> 
+  mutate(across(c(team_coverage_type, pass_location_type), ~ as.factor(.x)))
+test_glm  <- test_df  %>%
+  mutate(across(c(team_coverage_type, pass_location_type), ~ as.factor(.x)))
+
+# simple formula (add/remove predictors as desired)
+glm_formula <- as.formula(
+  "defender_within_2yds ~ def_s + def_a + distance_to_receiver + rec_s + rec_a + down + yards_to_go + defenders_in_the_box + team_coverage_type + pass_length + dropback_distance"
+)
+
+glm_model <- glm(glm_formula, data = train_glm, family = binomial())
+
+# predictions
+test_glm$pred_prob_glm <- predict(glm_model, newdata = test_glm, type = "response")
+
+# AUC
+auc_glm <- roc(test_glm$defender_within_2yds, test_glm$pred_prob_glm)$auc
+print(paste0("GLM AUC: ", round(auc_glm, 4)))
+
+summary(glm_model)
