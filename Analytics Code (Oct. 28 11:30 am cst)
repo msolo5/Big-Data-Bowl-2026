@@ -198,7 +198,9 @@ summary(glm_model)
 
 exp(coef(glm_model))
 
-pobe_summary <- test_glm |>
+df$pred_prob_glm <- predict(glm_model, newdata = df, type = "response")
+
+pobe_summary <- df |>
   group_by(def_name, defender_id) |>
   summarise(
     actual_play_on_ball_rate = mean(defender_within_2yds, na.rm = TRUE),
@@ -207,5 +209,6 @@ pobe_summary <- test_glm |>
     n_plays = n()
   ) |>
   arrange(desc(pobe))
+
 
 
