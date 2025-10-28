@@ -87,14 +87,14 @@ targeted_receivers <- pre_throw |>
 
 defenders <- pre_throw |>
   filter(player_side == "Defense") |>
-  select(game_id, play_id, frame_id, defender_id = nfl_id,
+  select(game_id, play_id, frame_id, defender_id = nfl_id, def_player_position = player_position,
          def_before_pass_x = before_pass_x, def_before_pass_y = before_pass_y, 
          def_s = s, def_a = a, def_dir = dir, def_o = o, def_name = player_name, ball_land_x, ball_land_y)
 
 defender_distances <- defenders |>
   inner_join(
     targeted_receivers |>
-      select(game_id, play_id, frame_id,
+      select(game_id, play_id, frame_id, off_player_position = player_position,
              rec_id = nfl_id, rec_before_pass_x = before_pass_x, rec_before_pass_y = before_pass_y, 
              rec_s = s, rec_a = a, rec_dir = dir, rec_o = o, rec_name = player_name),
     by = c("game_id", "play_id", "frame_id")
@@ -144,7 +144,8 @@ closest_defender_post_throw <- closest_defender_post_throw |>
 
 
 model_data <- closest_defender_post_throw |>
-  left_join(supp_data, by = c("game_id", "play_id"))
+  left_join(supp_data, by = c("game_id", "play_id")) |> 
+  filter(def_player_position %in% c("SS", "FS", "S", "CB"))
 
 # Select features (pre-throw only) and the target
 df <- model_data |> 
