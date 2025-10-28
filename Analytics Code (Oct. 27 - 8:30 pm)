@@ -1,0 +1,131 @@
+library(tidyverse)
+library(ggimage)
+library(scales)
+library(nflfastR)
+library(pacman)
+
+# Load individual input csv's
+input_2023_w01 <- read_csv("train/input_2023_w01.csv")
+input_2023_w02 <- read_csv("train/input_2023_w02.csv")
+input_2023_w03 <- read_csv("train/input_2023_w03.csv")
+input_2023_w04 <- read_csv("train/input_2023_w04.csv")
+input_2023_w05 <- read_csv("train/input_2023_w05.csv")
+input_2023_w06 <- read_csv("train/input_2023_w06.csv")
+input_2023_w07 <- read_csv("train/input_2023_w07.csv")
+input_2023_w08 <- read_csv("train/input_2023_w08.csv")
+input_2023_w09 <- read_csv("train/input_2023_w09.csv")
+input_2023_w10 <- read_csv("train/input_2023_w10.csv")
+input_2023_w11 <- read_csv("train/input_2023_w11.csv")
+input_2023_w12 <- read_csv("train/input_2023_w12.csv")
+input_2023_w13 <- read_csv("train/input_2023_w13.csv")
+input_2023_w10 <- read_csv("train/input_2023_w10.csv")
+input_2023_w11 <- read_csv("train/input_2023_w11.csv")
+input_2023_w12 <- read_csv("train/input_2023_w12.csv")
+input_2023_w13 <- read_csv("train/input_2023_w13.csv")
+input_2023_w14 <- read_csv("train/input_2023_w14.csv")
+input_2023_w15 <- read_csv("train/input_2023_w15.csv")
+input_2023_w16 <- read_csv("train/input_2023_w16.csv")
+input_2023_w17 <- read_csv("train/input_2023_w17.csv")
+input_2023_w18 <- read_csv("train/input_2023_w18.csv")
+
+# Load individual output csv's
+output_2023_w01 <- read_csv("train/output_2023_w01.csv")
+output_2023_w02 <- read_csv("train/output_2023_w02.csv")
+output_2023_w03 <- read_csv("train/output_2023_w03.csv")
+output_2023_w04 <- read_csv("train/output_2023_w04.csv")
+output_2023_w05 <- read_csv("train/output_2023_w05.csv")
+output_2023_w06 <- read_csv("train/output_2023_w06.csv")
+output_2023_w07 <- read_csv("train/output_2023_w07.csv")
+output_2023_w08 <- read_csv("train/output_2023_w08.csv")
+output_2023_w09 <- read_csv("train/output_2023_w09.csv")
+output_2023_w10 <- read_csv("train/output_2023_w10.csv")
+output_2023_w11 <- read_csv("train/output_2023_w11.csv")
+output_2023_w12 <- read_csv("train/output_2023_w12.csv")
+output_2023_w13 <- read_csv("train/output_2023_w13.csv")
+output_2023_w14 <- read_csv("train/output_2023_w14.csv")
+output_2023_w15 <- read_csv("train/output_2023_w15.csv")
+output_2023_w16 <- read_csv("train/output_2023_w16.csv")
+output_2023_w17 <- read_csv("train/output_2023_w17.csv")
+output_2023_w18 <- read_csv("train/output_2023_w18.csv")
+
+# Load supplementary data
+supp_data <- read_csv("~/Downloads/114239_nfl_competition_files_published_analytics_final/supplementary_data.csv")
+
+# --- Pre-throw: last frame before pass thrown ---
+pre_throw <- input_2023_w01 |>
+  group_by(game_id, play_id, nfl_id) |>
+  filter(frame_id == max(frame_id)) |>  # last frame before pass
+  rename(before_pass_x = x, before_pass_y = y)
+
+# --- Post-throw: final frame after ball lands ---
+post_throw <- output_2023_w01 |>
+  group_by(game_id, play_id, nfl_id) |>
+  filter(frame_id == max(frame_id)) |>
+  rename(after_pass_x = x, after_pass_y = y)
+
+targeted_receivers <- pre_throw |>
+  filter(player_role == "Targeted Receiver")
+
+defenders <- pre_throw |>
+  filter(player_side == "Defense") |>
+  select(game_id, play_id, frame_id, defender_id = nfl_id,
+         def_before_pass_x = before_pass_x, def_before_pass_y = before_pass_y, 
+         def_s = s, def_a = a, def_dir = dir, def_o = o, def_name = player_name, ball_land_x, ball_land_y)
+
+defender_distances <- defenders |>
+  inner_join(
+    targeted_receivers |>
+      select(game_id, play_id, frame_id,
+             rec_id = nfl_id, rec_before_pass_x = before_pass_x, rec_before_pass_y = before_pass_y, 
+             rec_s = s, rec_a = a, rec_dir = dir, rec_o = o, rec_name = player_name),
+    by = c("game_id", "play_id", "frame_id")
+  ) |>
+  mutate(distance_to_receiver = sqrt((def_before_pass_x - rec_before_pass_x)^2 + (def_before_pass_y - rec_before_pass_y)^2))
+
+closest_defender_each_frame <- defender_distances |>
+  group_by(game_id, play_id, frame_id) |>
+  slice_min(distance_to_receiver, n = 1) |>
+  ungroup()
+
+# --- Merge defender post-throw positions ---
+closest_defender_post_throw <- closest_defender_each_frame |>
+  left_join(
+    post_throw |>
+      select(game_id, play_id, nfl_id, after_pass_x, after_pass_y),
+    by = c("game_id", "play_id", "defender_id" = "nfl_id")
+  ) |>
+  rename(
+    def_after_pass_x = after_pass_x,
+    def_after_pass_y = after_pass_y
+  ) |>
+  mutate(ball_land_x = first(ball_land_x),
+         ball_land_y = first(ball_land_y),
+         .by = c(game_id, play_id))
+
+# --- Merge receiver post-throw positions ---
+closest_defender_post_throw <- closest_defender_post_throw |>
+  left_join(
+    post_throw |>
+      select(game_id, play_id, nfl_id, after_pass_x, after_pass_y),
+    by = c("game_id", "play_id", "rec_id" = "nfl_id")
+  ) |>
+  rename(
+    rec_after_pass_x = after_pass_x,
+    rec_after_pass_y = after_pass_y
+  )
+
+closest_defender_post_throw <- closest_defender_post_throw |>
+  mutate(
+    distance_def_to_ball = sqrt((def_after_pass_x - ball_land_x)^2 + (def_after_pass_y - ball_land_y)^2),
+    distance_rec_to_ball = sqrt((rec_after_pass_x - ball_land_x)^2 + (rec_after_pass_y - ball_land_y)^2),
+    defender_within_2yds = if_else(distance_def_to_ball <= 2, 1, 0)
+  ) |> 
+  filter(!is.na(def_after_pass_x)) |> 
+  filter(distance_rec_to_ball <= 5)
+
+
+model_data <- closest_defender_post_throw |>
+  left_join(supp_data, by = c("game_id", "play_id"))
+
+
+
