@@ -1,0 +1,142 @@
+suppressPackageStartupMessages({
+  if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+  pacman::p_load(dplyr, tidyr, stringr, purrr, rsample, xgboost, Matrix, stats)
+})
+
+clip01 <- function(x) pmin(pmax(as.numeric(x), 1e-6), 1 - 1e-6)
+auc_fast <- function(y, p){ y <- as.integer(y); n1 <- sum(y==1); n0 <- length(y)-n1; r <- rank(p, ties.method="average"); (sum(r[y==1]) - n1*(n1+1)/2) / (n1*n0) }
+ap_fast  <- function(y, p){ ord <- order(p, decreasing=TRUE); y <- as.integer(y)[ord]; k <- seq_along(y); sum(cumsum(y)/k * (y==1)) / max(1L, sum(y==1)) }
+ece10    <- function(y, p){ bins <- cut(p, seq(0,1,0.1), include.lowest=TRUE, right=TRUE); tb <- as.data.frame(aggregate(cbind(p,y) ~ bins, FUN=mean)); tb$n <- as.integer(table(bins)[tb$bins]); sum((tb$n/sum(tb$n)) * abs(tb$y - tb$p)) }
+cal_slope_intercept <- function(y,p){ eps <- 1e-12; fit <- glm(as.integer(y) ~ qlogis(p + eps), family=binomial()); c(intercept = coef(fit)[1], slope = coef(fit)[2]) }
+score_vec <- function(y,p){ y <- as.integer(y); p <- clip01(p); c(logloss = -mean(y*log(p) + (1-y)*log(1-p)), brier = mean((y-p)^2), auc = auc_fast(y,p), ap = ap_fast(y,p), ece10 = ece10(y,p)) }
+pick_min_n <- function(tbl, target=50L){ for (m in c(target,40L,30L,25L,20L,15L,10L,5L,1L)) if (nrow(dplyr::filter(tbl, n_plays >= m)) >= 20) return(m); 1L }
+
+stopifnot(exists("df"))
+need_cols <- c("game_id","play_id","defender_id","def_name","defender_within_2yds")
+stopifnot(all(need_cols %in% names(df)))
+
+num_feats <- c(
+  "def_before_pass_x","def_before_pass_y","def_s","def_a","def_dir","def_o",
+  "rec_before_pass_x","rec_before_pass_y","rec_s","rec_a","rec_dir","rec_o",
+  "distance_to_receiver","down","yards_to_go","pass_length","dropback_distance",
+  "defenders_in_the_box"
+)
+fac_cols <- intersect(c("team_coverage_type","pass_location_type"), names(df))
+
+df_glm <- df %>%
+  filter(!is.na(defender_within_2yds)) %>%
+  mutate(defender_within_2yds = as.integer(defender_within_2yds)) %>%
+  mutate(across(all_of(fac_cols), as.factor))
+
+set.seed(2025)
+plays <- df_glm %>% distinct(game_id, play_id)
+n_train <- floor(0.75 * nrow(plays))
+train_idx <- sample.int(nrow(plays), n_train)
+train_ids <- plays[train_idx, ]
+test_ids  <- plays[-train_idx, ]
+
+train_df <- df_glm %>% inner_join(train_ids, by = c("game_id","play_id"))
+test_df  <- df_glm %>% inner_join(test_ids,  by = c("game_id","play_id"))
+
+glm_feats <- c("def_s","def_a","distance_to_receiver","rec_s","rec_a",
+               "down","yards_to_go","defenders_in_the_box","team_coverage_type",
+               "pass_length","dropback_distance")
+glm_formula <- as.formula(paste("defender_within_2yds ~", paste(intersect(glm_feats, names(train_df)), collapse=" + ")))
+glm_model <- glm(glm_formula, data = train_df, family = binomial())
+test_df$pred_prob_glm <- as.numeric(predict(glm_model, newdata = test_df, type = "response"))
+df$pred_prob_glm      <- as.numeric(predict(glm_model, newdata = df_glm, type = "response"))
+
+one_hot <- function(d) {
+  f1 <- if ("team_coverage_type" %in% names(d)) model.matrix(~ team_coverage_type - 1, d) else NULL
+  f2 <- if ("pass_location_type" %in% names(d)) model.matrix(~ pass_location_type - 1, d) else NULL
+  num <- d %>% mutate(across(any_of(num_feats), as.numeric)) %>% select(any_of(num_feats)) %>% as.matrix()
+  mats <- Filter(Negate(is.null), list(num, f1, f2))
+  if (length(mats) == 1) mats[[1]] else do.call(cbind, mats)
+}
+
+X_train <- one_hot(train_df)
+X_test  <- one_hot(test_df)
+y_train <- as.numeric(train_df$defender_within_2yds)
+y_test  <- as.numeric(test_df$defender_within_2yds)
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+
+params <- list(objective="binary:logistic", eval_metric="logloss",
+               max_depth=4, eta=0.08, subsample=0.8, colsample_bytree=0.8,
+               min_child_weight=4, lambda=2.0, alpha=0.0)
+set.seed(2025)
+xgb_fit <- xgb.train(params=params, data=dtrain, nrounds=5000,
+                     watchlist=list(train=dtrain, eval=dtest),
+                     early_stopping_rounds=80, verbose=0)
+
+p_test_raw <- as.numeric(predict(xgb_fit, dtest))
+b0        <- coef(glm(y_test ~ 1, offset = qlogis(clip01(p_test_raw)), family = binomial()))[1]
+p_test_cal <- plogis(qlogis(clip01(p_test_raw)) + b0)
+si <- cal_slope_intercept(y_test, p_test_cal)
+p_test_best <- plogis(si["intercept"] + si["slope"] * qlogis(clip01(p_test_cal)))
+
+m_xgb  <- score_vec(y_test, p_test_best)
+m_glm  <- score_vec(y_test, clip01(test_df$pred_prob_glm))
+print(round(cbind(XGB = m_xgb, GLM = m_glm, Delta = m_xgb - m_glm), 6))
+
+X_full <- one_hot(df_glm)
+df$pred_prob_xgb_raw  <- as.numeric(predict(xgb_fit, xgb.DMatrix(X_full)))
+df$pred_prob_xgb_cal1 <- plogis(qlogis(clip01(df$pred_prob_xgb_raw)) + b0)
+df$pred_prob_xgb_best <- plogis(si["intercept"] + si["slope"] * qlogis(clip01(df$pred_prob_xgb_cal1)))
+
+mk_board <- function(dat, pcol){
+  dat %>%
+    transmute(defender_id, def_name,
+              y = as.integer(defender_within_2yds),
+              p = clip01(.data[[pcol]])) %>%
+    filter(is.finite(y), is.finite(p)) %>%
+    group_by(defender_id, def_name) %>%
+    summarise(n_plays = n(), exp_rate = mean(p), act_rate = mean(y),
+              pobe = act_rate - exp_rate, .groups="drop") %>%
+    mutate(se = sqrt(pmax(exp_rate*(1-exp_rate)/pmax(n_plays,1), 1e-12)),
+           z  = ifelse(se > 0, pobe/se, NA_real_),
+           sig = case_when(
+             is.na(z) ~ "",
+             2*pnorm(-abs(z)) < 0.001 ~ "***",
+             2*pnorm(-abs(z)) < 0.01  ~ "**",
+             2*pnorm(-abs(z)) < 0.05  ~ "*",
+             TRUE ~ ""
+           ))
+}
+
+board_xgb  <- mk_board(df_glm, "pred_prob_xgb_best")
+board_glm  <- mk_board(df_glm, "pred_prob_glm")
+
+min_n <- pick_min_n(board_xgb, target = 50L)
+p0    <- mean(df_glm$defender_within_2yds, na.rm = TRUE)
+prior_n <- 201L
+
+board_xgb_shrunk <- board_xgb %>%
+  mutate(act_shrunk = (act_rate * n_plays + p0 * prior_n) / (n_plays + prior_n),
+         pobe_shrunk = act_shrunk - exp_rate)
+
+fmt_raw <- function(tbl) tbl %>% transmute(defender_id, def_name, n_plays,
+                                           exp_rate = round(exp_rate,4),
+                                           act_rate = round(act_rate,4),
+                                           pobe = round(pobe,4),
+                                           z = round(z,2), sig)
+fmt_shr <- function(tbl) tbl %>% transmute(defender_id, def_name, n_plays,
+                                           exp_rate = round(exp_rate,4),
+                                           act_rate = round(act_shrunk,4),
+                                           pobe = round(pobe_shrunk,4))
+
+cat("\nTOP 20 — XGB (Raw POBE, n_plays >=", min_n, ")\n")
+print(board_xgb %>% filter(n_plays >= min_n) %>% arrange(desc(pobe)) %>% slice_head(n = 20) %>% fmt_raw(), n = 25)
+cat("\nBOTTOM 20 — XGB (Raw POBE, n_plays >=", min_n, ")\n")
+print(board_xgb %>% filter(n_plays >= min_n) %>% arrange(pobe)        %>% slice_head(n = 20) %>% fmt_raw(), n = 25)
+
+cat("\nTOP 20 — XGB (Shrunk POBE, n_plays >=", min_n, ")\n")
+print(board_xgb_shrunk %>% filter(n_plays >= min_n) %>% arrange(desc(pobe_shrunk)) %>% slice_head(n = 20) %>% fmt_shr(), n = 25)
+cat("\nBOTTOM 20 — XGB (Shrunk POBE, n_plays >=", min_n, ")\n")
+print(board_xgb_shrunk %>% filter(n_plays >= min_n) %>% arrange(pobe_shrunk)        %>% slice_head(n = 20) %>% fmt_shr(), n = 25)
+
+cat("\nTOP 20 — GLM (Raw POBE, n_plays >=", min_n, ")\n")
+print(board_glm %>% filter(n_plays >= min_n) %>% arrange(desc(pobe)) %>% slice_head(n = 20) %>% fmt_raw(), n = 25)
+cat("\nBOTTOM 20 — GLM (Raw POBE, n_plays >=", min_n, ")\n")
+print(board_glm %>% filter(n_plays >= min_n) %>% arrange(pobe)        %>% slice_head(n = 20) %>% fmt_raw(), n = 25)
