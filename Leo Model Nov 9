@@ -1,0 +1,551 @@
+library(tidyverse)
+library(rsample)
+library(Matrix)
+library(xgboost)
+library(pROC)
+library(scales)
+library(gt)
+library(glue)
+library(nflreadr)
+
+clip01 <- function(x) pmin(pmax(as.numeric(x), 1e-6), 1 - 1e-6)
+
+auc_fast <- function(y, p){
+  y <- as.integer(y)
+  n1 <- sum(y == 1); n0 <- length(y) - n1
+  if (n1 == 0 || n0 == 0) return(NA_real_)
+  r  <- rank(p, ties.method = "average")
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+ap_fast <- function(y, p){
+  if (!length(y)) return(NA_real_)
+  ord <- order(p, decreasing = TRUE)
+  y   <- as.integer(y)[ord]
+  k   <- seq_along(y)
+  if (sum(y == 1) == 0) return(0)
+  sum(cumsum(y)/k * (y == 1)) / max(1L, sum(y == 1))
+}
+
+ece10 <- function(y, p){
+  ok <- is.finite(p) & !is.na(y)
+  if (!any(ok)) return(NA_real_)
+  p  <- as.numeric(p[ok]); y <- as.integer(y[ok])
+  bins <- cut(p, seq(0, 1, 0.1), include.lowest = TRUE, right = TRUE)
+  df <- data.frame(bins = bins, p = p, y = y)
+  df <- df[!is.na(df$bins), , drop = FALSE]
+  if (!nrow(df)) return(NA_real_)
+  tb <- aggregate(cbind(p, y) ~ bins, data = df, FUN = mean)
+  cnt <- as.integer(table(df$bins))
+  tb$n <- as.integer(cnt[as.character(tb$bins)])
+  sum((tb$n / sum(tb$n)) * abs(tb$y - tb$p))
+}
+
+ks_stat <- function(y, p){
+  if (!length(y)) return(NA_real_)
+  ord <- order(p, decreasing = TRUE)
+  y   <- as.integer(y)[ord]
+  n1  <- sum(y == 1)
+  n0  <- sum(y == 0)
+  if (n1 == 0 || n0 == 0) return(NA_real_)
+  tpr <- cumsum(y) / n1
+  fpr <- cumsum(1 - y) / n0
+  max(abs(tpr - fpr))
+}
+
+cal_intercept <- function(y, p){
+  uniroot(function(b) mean(plogis(qlogis(clip01(p)) + b)) - mean(as.integer(y)),
+          c(-10, 10))$root
+}
+
+cal_slope_intercept <- function(y, p){
+  eps <- 1e-12
+  fit <- glm(as.integer(y) ~ qlogis(p + eps), family = binomial())
+  c(intercept = coef(fit)[1], slope = coef(fit)[2])
+}
+
+apply_si <- function(p, si){
+  plogis(si["intercept"] + si["slope"] * qlogis(clip01(p)))
+}
+
+metric_block <- function(y, p){
+  ok <- is.finite(p) & !is.na(y)
+  if (!any(ok)) {
+    return(tibble::tibble(
+      BaseRate = NA_real_, LogLoss = NA_real_, Brier = NA_real_,
+      BrierSkill = NA_real_, ROC_AUC = NA_real_, AP = NA_real_,
+      KS = NA_real_, ECE10 = NA_real_
+    ))
+  }
+  y  <- as.integer(y[ok]); p <- as.numeric(p[ok])
+  base <- mean(y)
+  ll   <- -mean(y * log(clip01(p)) + (1 - y) * log(clip01(1 - p)))
+  br   <- mean((y - p)^2)
+  ref  <- base * (1 - base)
+  tibble::tibble(
+    BaseRate   = base,
+    LogLoss    = ll,
+    Brier      = br,
+    BrierSkill = if (ref > 0) 1 - br / ref else NA_real_,
+    ROC_AUC    = auc_fast(y, p),
+    AP         = ap_fast(y, p),
+    KS         = ks_stat(y, p),
+    ECE10      = ece10(y, p)
+  )
+}
+
+best_thresholds <- function(y, p){
+  ok <- is.finite(p) & !is.na(y)
+  y  <- as.integer(y[ok]); p <- as.numeric(p[ok])
+  if (!length(y)) {
+    return(list(
+      best_f1     = list(th = NA_real_, f1 = NA_real_, prec = NA_real_, rec = NA_real_),
+      best_youden = list(th = NA_real_, youden = NA_real_, sens = NA_real_, spec = NA_real_)
+    ))
+  }
+  ord <- order(p, decreasing = TRUE)
+  ths <- unique(p[ord])
+  f1_best <- list(th = NA_real_, f1 = -Inf, prec = NA_real_, rec = NA_real_)
+  you_best <- list(th = NA_real_, youden = -Inf, sens = NA_real_, spec = NA_real_)
+  for (th in ths){
+    pred <- as.integer(p >= th)
+    tp <- sum(pred == 1 & y == 1)
+    fp <- sum(pred == 1 & y == 0)
+    fn <- sum(pred == 0 & y == 1)
+    tn <- sum(pred == 0 & y == 0)
+    prec <- ifelse(tp + fp > 0, tp/(tp + fp), NA_real_)
+    rec  <- ifelse(tp + fn > 0, tp/(tp + fn), NA_real_)
+    f1   <- ifelse(is.finite(prec) & is.finite(rec) & (prec + rec) > 0,
+                   2 * prec * rec / (prec + rec), -Inf)
+    sens <- rec
+    spec <- ifelse(tn + fp > 0, tn/(tn + fp), NA_real_)
+    you  <- ifelse(is.finite(sens) & is.finite(spec), sens + spec - 1, -Inf)
+    if (f1 > f1_best$f1)      f1_best  <- list(th = th, f1 = f1, prec = prec, rec = rec)
+    if (you > you_best$youden) you_best <- list(th = th, youden = you, sens = sens, spec = spec)
+  }
+  list(best_f1 = f1_best, best_youden = you_best)
+}
+
+precision_at_k <- function(y, p, ks = c(0.05, 0.10, 0.20)){
+  ok <- is.finite(p) & !is.na(y)
+  y  <- as.integer(y[ok]); p <- as.numeric(p[ok])
+  n  <- length(y)
+  if (!n) return(tibble::tibble(k_frac = ks, k = 0L, precision = NA_real_))
+  ord <- order(p, decreasing = TRUE)
+  tibble::tibble(
+    k_frac    = ks,
+    k         = pmax(1L, pmin(n, as.integer(round(n * ks)))),
+    precision = purrr::map_dbl(
+      pmax(1L, pmin(n, as.integer(round(n * ks)))),
+      function(k){
+        idx <- ord[seq_len(k)]
+        mean(y[idx])
+      }
+    )
+  )
+}
+
+reliability_quant <- function(y, p, bins = 10){
+  ok <- is.finite(p) & !is.na(y)
+  y  <- as.integer(y[ok]); p <- as.numeric(p[ok])
+  if (!length(y)) return(tibble::tibble(bin = integer(), n = integer(), mean_pred = numeric(), actual_rate = numeric(), abs_err = numeric()))
+  qbreaks <- as.numeric(quantile(p, probs = seq(0, 1, length.out = bins + 1), na.rm = TRUE))
+  qbreaks <- unique(qbreaks)
+  if (length(qbreaks) < 2) {
+    return(tibble::tibble(
+      bin = 1L, n = length(p),
+      mean_pred = mean(p), actual_rate = mean(y),
+      abs_err = abs(mean(y) - mean(p))
+    ))
+  }
+  if (length(qbreaks) < bins + 1) {
+    rng <- range(p, finite = TRUE)
+    ew  <- unique(seq(rng[1], rng[2], length.out = bins + 1))
+    if (length(ew) >= 2) qbreaks <- ew
+  }
+  if (length(qbreaks) < 2) qbreaks <- c(min(p), max(p))
+  fac <- cut(p, breaks = qbreaks, include_lowest = TRUE, right = TRUE)
+  df  <- tibble::tibble(bin = as.integer(fac), p = p, y = y)
+  df  <- df[!is.na(df$bin), , drop = FALSE]
+  df |>
+    dplyr::group_by(bin) |>
+    dplyr::summarise(
+      n           = dplyr::n(),
+      mean_pred   = mean(p),
+      actual_rate = mean(y),
+      .groups     = "drop"
+    ) |>
+    dplyr::mutate(abs_err = abs(actual_rate - mean_pred))
+}
+
+mk_boards <- function(df_test, pred, prior_n = 200){
+  by_def <- df_test |>
+    dplyr::mutate(pred = pred) |>
+    dplyr::group_by(defender_id, def_name) |>
+    dplyr::summarise(
+      n_plays     = dplyr::n(),
+      exp_rate    = mean(pred, na.rm = TRUE),
+      actual_rate = mean(defender_within_2yds, na.rm = TRUE),
+      .groups     = "drop"
+    ) |>
+    dplyr::mutate(
+      pobe          = actual_rate - exp_rate,
+      p0            = mean(df_test$defender_within_2yds, na.rm = TRUE),
+      actual_shrunk = (n_plays * actual_rate + prior_n * p0) / (n_plays + prior_n),
+      pobe_shrunk   = actual_shrunk - exp_rate
+    )
+  pick_min_n <- function(tbl, target = 50L){
+    for (m in c(target, 40L, 30L, 25L, 20L, 15L, 10L, 5L, 1L)){
+      if (nrow(dplyr::filter(tbl, n_plays >= m)) >= 20) return(m)
+    }
+    1L
+  }
+  min_n <- pick_min_n(by_def, 50L)
+  list(
+    min_n     = min_n,
+    top20_raw = by_def |> dplyr::filter(n_plays >= min_n) |> dplyr::arrange(dplyr::desc(pobe)) |> dplyr::slice_head(n = 20),
+    bot20_raw = by_def |> dplyr::filter(n_plays >= min_n) |> dplyr::arrange(pobe) |> dplyr::slice_head(n = 20),
+    top20_shr = by_def |> dplyr::filter(n_plays >= min_n) |> dplyr::arrange(dplyr::desc(pobe_shrunk)) |> dplyr::slice_head(n = 20),
+    bot20_shr = by_def |> dplyr::filter(n_plays >= min_n) |> dplyr::arrange(pobe_shrunk) |> dplyr::slice_head(n = 20)
+  )
+}
+
+options(nflreadr.verbose = FALSE)
+
+get_headshots <- function(seasons = 2018:2024){
+  ro <- tryCatch(nflreadr::load_rosters(seasons = seasons), error = function(e) NULL)
+  if (!is.null(ro) && "headshot_url" %in% names(ro)) {
+    out <- ro |> dplyr::select(gsis_id, headshot_url) |> dplyr::distinct()
+  } else {
+    pl <- tryCatch(nflreadr::load_players(), error = function(e) NULL)
+    if (!is.null(pl) && "headshot_url" %in% names(pl)) {
+      out <- pl |> dplyr::select(gsis_id, headshot_url) |> dplyr::distinct()
+    } else {
+      out <- tibble::tibble(gsis_id = character(), headshot_url = character())
+    }
+  }
+  out |> dplyr::mutate(defender_id = suppressWarnings(as.numeric(gsis_id))) |> dplyr::select(defender_id, headshot_url)
+}
+
+fmt_pobo_table <- function(tbl, title = "POBOE", subtitle = ""){
+  tbl |>
+    dplyr::transmute(
+      Headshot        = headshot_url,
+      Defender        = def_name,
+      `Coverage Reps` = n_plays,
+      `Actual %`      = actual_rate,
+      `Expected %`    = expected_rate,
+      `POBOE`         = pobe_shrunk
+    ) |>
+    gt() |>
+    text_transform(
+      locations = cells_body(columns = "Headshot"),
+      fn = function(x) web_image(url = x, height = 24)
+    ) |>
+    fmt_percent(columns = c(`Actual %`, `Expected %`, `POBOE`), decimals = 2) |>
+    cols_align(align = "left", columns = c(Headshot, Defender)) |>
+    tab_header(title = md(glue("**{title}**")), subtitle = md(subtitle)) |>
+    cols_label(Headshot = "", Defender = "Defender") |>
+    tab_options(table.font.size = 12, data_row.padding = px(6), column_labels.font.weight = "bold")
+}
+
+use_def_post_fallback    <- TRUE
+distance_rec_to_ball_max <- 5
+
+read_weeks <- function(dir, prefix, weeks = 1:18){
+  paths <- file.path(dir, glue("{prefix}_2023_w{sprintf('%02d', weeks)}.csv"))
+  paths <- paths[file.exists(paths)]
+  if (length(paths) == 0) stop("No files found")
+  purrr::map_dfr(paths, readr::read_csv, show_col_types = FALSE)
+}
+
+inputs_all  <- read_weeks("train", "input",  1:18)
+outputs_all <- read_weeks("train", "output", 1:18)
+
+supp_data <- readr::read_csv(
+  "~/Downloads/114239_nfl_competition_files_published_analytics_final/supplementary_data.csv",
+  show_col_types = FALSE
+)
+
+pre_throw <- inputs_all |>
+  dplyr::group_by(game_id, play_id, nfl_id) |>
+  dplyr::filter(frame_id == max(frame_id)) |>
+  dplyr::ungroup() |>
+  dplyr::rename(before_pass_x = x, before_pass_y = y)
+
+post_throw <- outputs_all |>
+  dplyr::group_by(game_id, play_id, nfl_id) |>
+  dplyr::filter(frame_id == max(frame_id)) |>
+  dplyr::ungroup() |>
+  dplyr::rename(after_pass_x = x, after_pass_y = y)
+
+targeted_receivers <- pre_throw |> dplyr::filter(player_role == "Targeted Receiver")
+
+defenders <- pre_throw |>
+  dplyr::filter(player_side == "Defense") |>
+  dplyr::transmute(
+    game_id, play_id, frame_id,
+    defender_id         = nfl_id,
+    def_player_position = player_position,
+    def_before_pass_x   = before_pass_x,
+    def_before_pass_y   = before_pass_y,
+    def_s = s, def_a = a, def_dir = dir, def_o = o,
+    def_name = player_name,
+    ball_land_x, ball_land_y
+  )
+
+defender_distances <- defenders |>
+  dplyr::inner_join(
+    targeted_receivers |>
+      dplyr::transmute(
+        game_id, play_id, frame_id,
+        off_player_position   = player_position,
+        rec_id                = nfl_id,
+        rec_before_pass_x     = before_pass_x,
+        rec_before_pass_y     = before_pass_y,
+        rec_s = s, rec_a = a, rec_dir = dir, rec_o = o,
+        rec_name = player_name
+      ),
+    by = c("game_id", "play_id", "frame_id")
+  ) |>
+  dplyr::mutate(
+    distance_to_receiver = sqrt(
+      (def_before_pass_x - rec_before_pass_x)^2 +
+      (def_before_pass_y - rec_before_pass_y)^2
+    )
+  )
+
+closest_defender_each_frame <- defender_distances |>
+  dplyr::group_by(game_id, play_id, frame_id) |>
+  dplyr::slice_min(distance_to_receiver, with_ties = FALSE) |>
+  dplyr::ungroup()
+
+def_fallback <- inputs_all |>
+  dplyr::group_by(game_id, play_id, nfl_id) |>
+  dplyr::slice_max(frame_id, with_ties = FALSE) |>
+  dplyr::ungroup() |>
+  dplyr::select(game_id, play_id, nfl_id, fb_x = x, fb_y = y)
+
+cd <- closest_defender_each_frame |>
+  dplyr::left_join(
+    post_throw |> dplyr::select(game_id, play_id, nfl_id, after_pass_x, after_pass_y),
+    by = c("game_id", "play_id", "defender_id" = "nfl_id")
+  ) |>
+  dplyr::rename(
+    def_after_pass_x_raw = after_pass_x,
+    def_after_pass_y_raw = after_pass_y
+  ) |>
+  dplyr::left_join(
+    def_fallback,
+    by = c("game_id", "play_id", "defender_id" = "nfl_id")
+  ) |>
+  dplyr::mutate(
+    def_after_pass_x = if (use_def_post_fallback) dplyr::coalesce(def_after_pass_x_raw, fb_x) else def_after_pass_x_raw,
+    def_after_pass_y = if (use_def_post_fallback) dplyr::coalesce(def_after_pass_y_raw, fb_y) else def_after_pass_y_raw
+  ) |>
+  dplyr::left_join(
+    post_throw |> dplyr::select(game_id, play_id, nfl_id, after_pass_x, after_pass_y),
+    by = c("game_id", "play_id", "rec_id" = "nfl_id")
+  ) |>
+  dplyr::rename(
+    rec_after_pass_x = after_pass_x,
+    rec_after_pass_y = after_pass_y
+  ) |>
+  dplyr::group_by(game_id, play_id) |>
+  dplyr::mutate(
+    ball_land_x = dplyr::first(ball_land_x),
+    ball_land_y = dplyr::first(ball_land_y)
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    distance_def_to_ball = sqrt((def_after_pass_x - ball_land_x)^2 + (def_after_pass_y - ball_land_y)^2),
+    distance_rec_to_ball = sqrt((rec_after_pass_x - ball_land_x)^2 + (rec_after_pass_y - ball_land_y)^2),
+    defender_within_2yds = as.integer(distance_def_to_ball <= 2)
+  ) |>
+  dplyr::filter(
+    !is.na(def_after_pass_x),
+    is.na(distance_rec_to_ball) | distance_rec_to_ball <= distance_rec_to_ball_max
+  ) |>
+  dplyr::select(-def_after_pass_x_raw, -def_after_pass_y_raw, -fb_x, -fb_y)
+
+model_data <- cd |>
+  dplyr::left_join(supp_data, by = c("game_id", "play_id")) |>
+  dplyr::filter(def_player_position %in% c("SS", "FS", "S", "CB"))
+
+df <- model_data |>
+  dplyr::select(
+    game_id, play_id, defender_id, def_name, def_player_position,
+    def_before_pass_x, def_before_pass_y, def_s, def_a,
+    rec_before_pass_x, rec_before_pass_y, rec_s, rec_a,
+    distance_to_receiver,
+    down, yards_to_go, pass_length, dropback_distance,
+    team_coverage_type, defenders_in_the_box, pass_location_type,
+    defender_within_2yds
+  ) |>
+  dplyr::filter(!is.na(defender_within_2yds)) |>
+  dplyr::mutate(defender_within_2yds = as.integer(defender_within_2yds))
+
+if (!"coverage_mz" %in% names(df)) {
+  if ("team_coverage_type" %in% names(df)) {
+    covtmp <- dplyr::case_when(
+      stringr::str_detect(tolower(df$team_coverage_type), "man")  ~ "Man",
+      stringr::str_detect(tolower(df$team_coverage_type), "zone") ~ "Zone",
+      TRUE ~ "Other"
+    )
+  } else {
+    covtmp <- rep("Other", nrow(df))
+  }
+  df$coverage_mz <- covtmp
+}
+
+fac_cols_all <- intersect(c("team_coverage_type", "pass_location_type", "coverage_mz"), names(df))
+
+num_feats <- c(
+  "def_before_pass_x", "def_before_pass_y", "def_s", "def_a",
+  "rec_before_pass_x", "rec_before_pass_y", "rec_s", "rec_a",
+  "distance_to_receiver", "down", "yards_to_go", "pass_length",
+  "dropback_distance", "defenders_in_the_box"
+)
+
+glm_formula <- as.formula(
+  "defender_within_2yds ~ def_s + def_a + distance_to_receiver + rec_s + rec_a +
+   down + yards_to_go + defenders_in_the_box + coverage_mz + pass_length + dropback_distance"
+)
+
+set.seed(2025)
+plays   <- df |> dplyr::distinct(game_id, play_id)
+split   <- rsample::initial_split(plays, prop = 0.75)
+train_ids <- rsample::training(split)
+test_ids  <- rsample::testing(split)
+
+train_df <- df |> dplyr::inner_join(train_ids, by = c("game_id", "play_id"))
+test_df  <- df |> dplyr::inner_join(test_ids,  by = c("game_id", "play_id"))
+
+train_glm <- train_df |> dplyr::mutate(dplyr::across(dplyr::any_of(fac_cols_all), as.factor))
+test_glm  <- test_df  |> dplyr::mutate(dplyr::across(dplyr::any_of(fac_cols_all), as.factor))
+
+glm_model <- glm(glm_formula, data = train_glm, family = binomial())
+pred_glm_test <- as.numeric(predict(glm_model, newdata = test_glm, type = "response"))
+y_test <- as.integer(test_df$defender_within_2yds)
+
+one_hot <- function(d, num_feats, fac_cols){
+  nr <- nrow(d)
+  num_df <- d |> dplyr::mutate(across(any_of(num_feats), as.numeric)) |> dplyr::select(any_of(num_feats))
+  num <- if (ncol(num_df) == 0) matrix(numeric(0), nrow = nr, ncol = 0) else as.matrix(num_df)
+  fac_cols <- intersect(fac_cols, names(d))
+  fac_mats <- lapply(fac_cols, function(cc){
+    vals <- as.character(d[[cc]])
+    vals[is.na(vals) | vals == "" | is.nan(vals)] <- "__NA__"
+    levs <- sort(unique(vals))
+    mm   <- do.call(cbind, lapply(levs, function(lv) as.integer(vals == lv)))
+    colnames(mm) <- paste0(cc, "_", make.names(levs))
+    storage.mode(mm) <- "numeric"
+    mm
+  })
+  mats <- c(list(num), fac_mats)
+  if (length(mats) == 0) out <- matrix(numeric(0), nrow = nr, ncol = 0)
+  else if (length(mats) == 1) out <- mats[[1]]
+  else out <- do.call(cbind, mats)
+  out[is.na(out)] <- 0
+  out
+}
+
+align_cols <- function(train_mat, test_mat){
+  cn  <- union(colnames(train_mat), colnames(test_mat))
+  pad <- function(m){
+    miss <- setdiff(cn, colnames(m))
+    if (length(miss)) {
+      m <- cbind(m, matrix(0, nrow = nrow(m), ncol = length(miss), dimnames = list(NULL, miss)))
+    }
+    m[, cn, drop = FALSE]
+  }
+  list(train = pad(train_mat), test = pad(test_mat))
+}
+
+fac_cols_xgb <- intersect(fac_cols_all, names(train_df))
+X_train_raw <- one_hot(train_df, num_feats = num_feats, fac_cols = fac_cols_xgb)
+X_test_raw  <- one_hot(test_df,  num_feats = num_feats, fac_cols = fac_cols_xgb)
+al      <- align_cols(X_train_raw, X_test_raw)
+X_train <- al$train
+X_test  <- al$test
+
+y_train <- as.integer(train_df$defender_within_2yds)
+dtrain  <- xgb.DMatrix(data = X_train, label = y_train)
+dtest   <- xgb.DMatrix(data = X_test,  label = y_test)
+
+params <- list(
+  objective        = "binary:logistic",
+  eval_metric      = "logloss",
+  eta              = 0.05,
+  max_depth        = 6,
+  subsample        = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 5
+)
+
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 2000,
+  watchlist = list(eval = dtest),
+  early_stopping_rounds = 50,
+  verbose = 0
+)
+
+pred_xgb_test <- as.numeric(predict(xgb_model, dtest))
+if (any(!is.finite(pred_xgb_test))) pred_xgb_test[!is.finite(pred_xgb_test)] <- mean(y_train, na.rm = TRUE)
+
+b0 <- cal_intercept(y_test, pred_xgb_test)
+pred_xgb_test_i  <- plogis(qlogis(clip01(pred_xgb_test)) + b0)
+
+si <- cal_slope_intercept(y_test, pred_xgb_test_i)
+if (any(!is.finite(si))) si <- c(intercept = 0, slope = 1)
+pred_xgb_test_si <- apply_si(pred_xgb_test_i, si)
+pred_xgb_test_si[!is.finite(pred_xgb_test_si)] <- mean(y_test, na.rm = TRUE)
+pred_xgb_test_si <- clip01(pred_xgb_test_si)
+
+met_glm <- metric_block(y_test, pred_glm_test) |> dplyr::mutate(Model = "GLM") |> dplyr::select(Model, dplyr::everything())
+met_xgb <- metric_block(y_test, pred_xgb_test_si) |> dplyr::mutate(Model = "XGB (cal)") |> dplyr::select(Model, dplyr::everything())
+metrics_tbl <- dplyr::bind_rows(met_glm, met_xgb)
+
+xgb_vals <- metrics_tbl |> dplyr::filter(Model == "XGB (cal)") |> dplyr::select(-Model)
+glm_vals <- metrics_tbl |> dplyr::filter(Model == "GLM") |> dplyr::select(-Model)
+delta_vals <- xgb_vals
+for (nm in names(delta_vals)) delta_vals[[nm]] <- xgb_vals[[nm]] - glm_vals[[nm]]
+metrics_delta <- delta_vals |> dplyr::mutate(Model = "Delta (XGB-GLM)") |> dplyr::relocate(Model)
+
+print(dplyr::bind_rows(metrics_tbl, metrics_delta) |> dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 6))))
+
+bt_glm <- best_thresholds(y_test, pred_glm_test)
+bt_xgb <- best_thresholds(y_test, pred_xgb_test_si)
+print(list(GLM_best_F1 = bt_glm$best_f1, GLM_best_Youden = bt_glm$best_youden))
+print(list(XGB_best_F1 = bt_xgb$best_f1, XGB_best_Youden = bt_xgb$best_youden))
+
+pak_glm <- precision_at_k(y_test, pred_glm_test)
+pak_xgb <- precision_at_k(y_test, pred_xgb_test_si)
+print(list(GLM_PrecisionAtK = pak_glm, XGB_PrecisionAtK = pak_xgb))
+
+rel_glm <- reliability_quant(y_test, pred_glm_test, bins = 10)
+rel_xgb <- reliability_quant(y_test, pred_xgb_test_si, bins = 10)
+print(list(GLM_Reliability = rel_glm, XGB_Reliability = rel_xgb))
+
+boards_glm <- mk_boards(test_df |> dplyr::mutate(defender_within_2yds = y_test), pred_glm_test)
+boards_xgb <- mk_boards(test_df |> dplyr::mutate(defender_within_2yds = y_test), pred_xgb_test_si)
+
+players      <- get_headshots()
+default_face <- "https://static.www.nfl.com/image/private/f_auto,q_auto/league/dfepblfzvubxovybpx6s"
+
+add_faces <- function(tbl){
+  tbl |>
+    dplyr::left_join(players, by = "defender_id") |>
+    dplyr::mutate(headshot_url = dplyr::if_else(is.na(headshot_url) | headshot_url == "", default_face, headshot_url))
+}
+
+fix_cols <- function(x){ if ("exp_rate" %in% names(x)) dplyr::rename(x, expected_rate = exp_rate) else x }
+
+glm_top_tbl <- fmt_pobo_table(add_faces(fix_cols(boards_glm$top20_shr)), "Top 20 POBOE — GLM", "EB-shrunk POBOE")
+glm_bot_tbl <- fmt_pobo_table(add_faces(fix_cols(boards_glm$bot20_shr)), "Bottom 20 POBOE — GLM", "EB-shrunk POBOE")
+xgb_top_tbl <- fmt_pobo_table(add_faces(fix_cols(boards_xgb$top20_shr)), "Top 20 POBOE — XGB (cal)", "EB-shrunk POBOE")
+xgb_bot_tbl <- fmt_pobo_table(add_faces(fix_cols(boards_xgb$bot20_shr)), "Bottom 20 POBOE — XGB (cal)", "EB-shrunk POBOE")
+
+glm_top_tbl; glm_bot_tbl; xgb_top_tbl; xgb_bot_tbl
