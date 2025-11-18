@@ -1,0 +1,529 @@
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(ggimage)
+library(scales)
+library(nflfastR)
+library(nflplotR)
+library(pacman)
+library(rsample)
+library(pROC)
+library(xgboost)
+library(Matrix)
+library(ggplot2)
+library(gt)
+library(gtExtras)
+library(glue)
+library(magick)
+library(glue)
+library(stringr)
+library(gganimate)
+library(ggrepel)
+library(gifski)
+
+# Load individual input csv's
+input_2023_w01 <- read_csv("train/input_2023_w01.csv")
+input_2023_w02 <- read_csv("train/input_2023_w02.csv")
+input_2023_w03 <- read_csv("train/input_2023_w03.csv")
+input_2023_w04 <- read_csv("train/input_2023_w04.csv")
+input_2023_w05 <- read_csv("train/input_2023_w05.csv")
+input_2023_w06 <- read_csv("train/input_2023_w06.csv")
+input_2023_w07 <- read_csv("train/input_2023_w07.csv")
+input_2023_w08 <- read_csv("train/input_2023_w08.csv")
+input_2023_w09 <- read_csv("train/input_2023_w09.csv")
+input_2023_w10 <- read_csv("train/input_2023_w10.csv")
+input_2023_w11 <- read_csv("train/input_2023_w11.csv")
+input_2023_w12 <- read_csv("train/input_2023_w12.csv")
+input_2023_w13 <- read_csv("train/input_2023_w13.csv")
+input_2023_w14 <- read_csv("train/input_2023_w14.csv")
+input_2023_w15 <- read_csv("train/input_2023_w15.csv")
+input_2023_w16 <- read_csv("train/input_2023_w16.csv")
+input_2023_w17 <- read_csv("train/input_2023_w17.csv")
+input_2023_w18 <- read_csv("train/input_2023_w18.csv")
+
+inputs_all <- bind_rows(
+  input_2023_w01, input_2023_w02, input_2023_w03, input_2023_w04, input_2023_w05,
+  input_2023_w06, input_2023_w07, input_2023_w08, input_2023_w09, input_2023_w10,
+  input_2023_w11, input_2023_w12, input_2023_w13, input_2023_w14, input_2023_w15,
+  input_2023_w16, input_2023_w17, input_2023_w18
+)
+
+# Load individual output csv's
+output_2023_w01 <- read_csv("train/output_2023_w01.csv")
+output_2023_w02 <- read_csv("train/output_2023_w02.csv")
+output_2023_w03 <- read_csv("train/output_2023_w03.csv")
+output_2023_w04 <- read_csv("train/output_2023_w04.csv")
+output_2023_w05 <- read_csv("train/output_2023_w05.csv")
+output_2023_w06 <- read_csv("train/output_2023_w06.csv")
+output_2023_w07 <- read_csv("train/output_2023_w07.csv")
+output_2023_w08 <- read_csv("train/output_2023_w08.csv")
+output_2023_w09 <- read_csv("train/output_2023_w09.csv")
+output_2023_w10 <- read_csv("train/output_2023_w10.csv")
+output_2023_w11 <- read_csv("train/output_2023_w11.csv")
+output_2023_w12 <- read_csv("train/output_2023_w12.csv")
+output_2023_w13 <- read_csv("train/output_2023_w13.csv")
+output_2023_w14 <- read_csv("train/output_2023_w14.csv")
+output_2023_w15 <- read_csv("train/output_2023_w15.csv")
+output_2023_w16 <- read_csv("train/output_2023_w16.csv")
+output_2023_w17 <- read_csv("train/output_2023_w17.csv")
+output_2023_w18 <- read_csv("train/output_2023_w18.csv")
+
+outputs_all <- bind_rows(
+  output_2023_w01, output_2023_w02, output_2023_w03, output_2023_w04, output_2023_w05,
+  output_2023_w06, output_2023_w07, output_2023_w08, output_2023_w09, output_2023_w10,
+  output_2023_w11, output_2023_w12, output_2023_w13, output_2023_w14, output_2023_w15,
+  output_2023_w16, output_2023_w17, output_2023_w18
+)
+
+all_frames <- inputs_all |>
+  group_by(game_id, play_id, nfl_id) |>
+  mutate(max_input_frame = max(frame_id)) |>
+  ungroup() |>
+  bind_rows(
+    outputs_all |>
+      left_join(
+        inputs_all |>
+          group_by(game_id, play_id, nfl_id) |>
+          summarize(max_input_frame = max(frame_id), .groups = "drop"),
+        by = c("game_id", "play_id", "nfl_id")
+      ) |>
+      mutate(frame_id = frame_id + max_input_frame)
+  ) |>
+  select(-max_input_frame) |>
+  arrange(game_id, play_id, nfl_id, frame_id)
+
+# Load supplementary data
+supp_data <- read_csv("~/Downloads/114239_nfl_competition_files_published_analytics_final/supplementary_data.csv")
+
+# Load in nflplotR data
+team_abbr <- valid_team_names()
+teams_colors_logos
+
+
+# ---- 4. NFL Roster ----
+players <- fast_scraper_roster(2023)
+
+# ---- 5. Pre- and Post-Throw Frames ----
+pre_throw <- inputs_all |>
+  group_by(game_id, play_id, nfl_id) |>
+  filter(frame_id == max(frame_id)) |>
+  rename(before_pass_x = x, before_pass_y = y)
+
+post_throw <- outputs_all |>
+  group_by(game_id, play_id, nfl_id) |>
+  filter(frame_id == max(frame_id)) |>
+  rename(after_pass_x = x, after_pass_y = y)
+
+targeted_receivers <- pre_throw |> filter(player_role == "Targeted Receiver")
+
+defenders <- pre_throw |>
+  filter(player_side == "Defense") |>
+  select(game_id, play_id, frame_id, defender_id = nfl_id, def_player_position = player_position,
+         def_before_pass_x = before_pass_x, def_before_pass_y = before_pass_y,
+         def_s = s, def_a = a, def_dir = dir, def_o = o, def_name = player_name, ball_land_x, ball_land_y)
+
+# ---- 6. Find Closest Defender ----
+defender_distances <- defenders |>
+  inner_join(
+    targeted_receivers |>
+      select(game_id, play_id, frame_id, off_player_position = player_position,
+             rec_id = nfl_id, rec_before_pass_x = before_pass_x, rec_before_pass_y = before_pass_y,
+             rec_s = s, rec_a = a, rec_dir = dir, rec_o = o, rec_name = player_name),
+    by = c("game_id", "play_id", "frame_id")
+  ) |>
+  mutate(distance_to_receiver = sqrt((def_before_pass_x - rec_before_pass_x)^2 +
+                                       (def_before_pass_y - rec_before_pass_y)^2))
+
+closest_defender_each_frame <- defender_distances |>
+  group_by(game_id, play_id, frame_id) |>
+  slice_min(distance_to_receiver, n = 1) |>
+  ungroup()
+
+# ---- 7. Merge Post-Throw ----
+closest_defender_post_throw <- closest_defender_each_frame |>
+  left_join(
+    post_throw |> select(game_id, play_id, nfl_id, after_pass_x, after_pass_y),
+    by = c("game_id", "play_id", "defender_id" = "nfl_id")
+  ) |>
+  rename(def_after_pass_x = after_pass_x, def_after_pass_y = after_pass_y) |>
+  mutate(ball_land_x = first(ball_land_x),
+         ball_land_y = first(ball_land_y),
+         .by = c(game_id, play_id)) |>
+  left_join(
+    post_throw |> select(game_id, play_id, nfl_id, after_pass_x, after_pass_y),
+    by = c("game_id", "play_id", "rec_id" = "nfl_id")
+  ) |>
+  rename(rec_after_pass_x = after_pass_x, rec_after_pass_y = after_pass_y) |>
+  mutate(
+    distance_def_to_ball = sqrt((def_after_pass_x - ball_land_x)^2 + (def_after_pass_y - ball_land_y)^2),
+    distance_rec_to_ball = sqrt((rec_after_pass_x - ball_land_x)^2 + (rec_after_pass_y - ball_land_y)^2),
+    defender_within_2yds = if_else(distance_def_to_ball <= 2, 1, 0)
+  ) |>
+  filter(!is.na(def_after_pass_x)) |>
+  filter(distance_rec_to_ball <= 5)
+
+# ---- 8. Merge with Context ----
+model_data <- closest_defender_post_throw |>
+  left_join(supp_data, by = c("game_id", "play_id")) |>
+  filter(def_player_position %in% c("SS", "FS", "S", "CB"))
+
+# ---- 9. Build Model Dataset ----
+df <- model_data |>
+  select(game_id, play_id, defender_id, def_name, def_player_position,
+         def_before_pass_x, def_before_pass_y, def_s, def_a, def_dir, def_o,
+         rec_before_pass_x, rec_before_pass_y, rec_s, rec_a, rec_dir, rec_o,
+         distance_to_receiver, down, yards_to_go, pass_length, dropback_distance,
+         team_coverage_man_zone, defenders_in_the_box, pass_location_type, defender_within_2yds) |>
+  filter(!is.na(defender_within_2yds)) |>
+  mutate(defender_within_2yds = as.integer(defender_within_2yds))
+
+# ---- 10. Split Between CB and Safety, and Man and Zone ----
+cb_df <- df |>
+  filter(def_player_position == "CB", team_coverage_man_zone == "MAN_COVERAGE")
+
+safety_df <- df |>
+  filter(def_player_position %in% c("S", "FS", "SS"),
+         team_coverage_man_zone == "ZONE_COVERAGE")
+
+
+# Define a helper function to train, evaluate, and summarize
+train_glm_model <- function(data, position_label) {
+  set.seed(2025)
+  plays <- data |> distinct(game_id, play_id)
+  split <- initial_split(plays, prop = 0.75)
+  train_ids <- training(split)
+  test_ids  <- testing(split)
+  
+  train_df <- data |> inner_join(train_ids, by = c("game_id", "play_id"))
+  test_df  <- data |> inner_join(test_ids,  by = c("game_id", "play_id"))
+  
+  train_glm <- train_df |> mutate(across(pass_location_type, as.factor))
+  test_glm  <- test_df  |> mutate(across(pass_location_type, as.factor))
+  
+  glm_formula <- as.formula(
+    "defender_within_2yds ~ def_s + def_a + distance_to_receiver + rec_s + rec_a +
+   down + yards_to_go + defenders_in_the_box + pass_length + dropback_distance"
+  )
+  
+  glm_model <- glm(glm_formula, data = train_glm, family = binomial())
+  test_glm$pred_prob_glm <- predict(glm_model, newdata = test_glm, type = "response")
+  
+  auc_glm <- roc(test_glm$defender_within_2yds, test_glm$pred_prob_glm)$auc
+  print(glue("{position_label} GLM AUC: {round(auc_glm, 4)}"))
+  
+  data$pred_prob_glm <- predict(glm_model, newdata = data, type = "response")
+  
+  summary_table <- data |>
+    group_by(def_name, defender_id) |>
+    summarise(
+      actual_play_on_ball_rate = round(mean(defender_within_2yds, na.rm = TRUE) * 100, 2),
+      expected_play_on_ball_rate = round(mean(pred_prob_glm, na.rm = TRUE) * 100, 2),
+      poboe = round((mean(defender_within_2yds, na.rm = TRUE) -
+                       mean(pred_prob_glm, na.rm = TRUE)) * 100, 2),
+      n_plays = n()
+    ) |>
+    filter(n_plays >= 20) |>
+    mutate(defender_id = as.character(defender_id)) |>
+    left_join(players |> select(gsis_it_id, headshot_url), by = c("defender_id" = "gsis_it_id")) |>
+    arrange(-poboe)
+  
+  # ---- Visualization ----
+  summary_table |>
+    ungroup() |>
+    gt(rowname_col = "def_name") |>
+    cols_hide(c(defender_id)) |>
+    tab_header(
+      title = md(glue("**Average POBOE ({position_label}s)**")),
+      subtitle = md("*2023 | Play on Ball over Expected = Actual Play on Ball % - Expected Play on Ball %*")
+    ) |>
+    tab_stubhead(label = "Defender") |>
+    gt_img_rows(headshot_url, height = 25) |>
+    cols_label(
+      def_name = "Defender",
+      headshot_url = "",
+      n_plays = "Coverage Reps",
+      expected_play_on_ball_rate = "Expected %",
+      actual_play_on_ball_rate = "Actual %",
+      poboe = "POBOE"
+    ) |>
+    cols_move_to_start(columns = c(headshot_url, n_plays)) |>
+    gt_color_box(
+      poboe,
+      palette = c("red", "yellow", "green"),
+      domain = range(summary_table$poboe, na.rm = TRUE),
+      accuracy = 0.01
+    ) |>
+    tab_style(
+      style = cell_text(size = px(13)),  # smaller font for POBOE
+      locations = cells_body(columns = poboe)
+    )
+}
+
+# ---- 12. Train and Output Tables ----
+cb_table <- train_glm_model(cb_df, "Cornerback")
+safety_table <- train_glm_model(safety_df, "Safetie")
+
+cb_table
+safety_table
+
+#######
+
+## TANNER CODE
+
+#Calculate open pct
+receiver_open_score <- inputs_all |>
+  filter(player_side == "Offense", player_role == "Targeted Receiver") |>
+  inner_join(
+    inputs_all |> 
+      filter(player_side == "Defense") |>
+      select(game_id, play_id, frame_id, absolute_yardline_number, player_name, player_position, 
+             player_side, player_role, def_id = nfl_id, def_x = x, def_y = y),
+    by = c("game_id", "play_id", "frame_id")
+  ) |>
+  mutate(distance = sqrt((x - def_x)^2 + (y - def_y)^2)) |>
+  group_by(game_id, play_id, frame_id, nfl_id) |>
+  summarise(min_distance = min(distance, na.rm = TRUE), .groups = "drop_last") |>
+  mutate(is_open = min_distance > 2) |>
+  summarise(open_pct = mean(is_open, na.rm = TRUE), .groups = "drop")
+
+#######
+
+# ============================================================
+# 1. Specify Play
+# ============================================================
+selected_game <- 2023091010
+selected_play  <- 3198
+
+play_data <- all_frames %>%
+  filter(game_id == selected_game, play_id == selected_play) %>%
+  arrange(frame_id, nfl_id)
+
+# ============================================================
+# 2. Role Colors & Shapes
+# ============================================================
+role_colors <- c(
+  "Passer" = "orange",
+  "Targeted Receiver" = "limegreen",
+  "Other Route Runner" = "yellow",
+  "Defensive Coverage" = "blue",
+  "Football" = "brown"
+)
+
+play_data <- play_data %>%
+  mutate(
+    role_color = role_colors[player_role],
+    shape_val  = ifelse(player_side == "Offense", 16, 17)
+  )
+
+# ============================================================
+# 3. Fill Missing Frames
+# ============================================================
+max_frame <- max(play_data$frame_id)
+
+all_frames_in_play <- play_data %>%
+  group_by(nfl_id) %>%
+  complete(frame_id = 1:max_frame) %>%
+  fill(
+    x, y, role_color, shape_val, player_side, player_role, player_name,
+    ball_land_x, ball_land_y,
+    .direction = "down"
+  ) %>%
+  ungroup()
+
+# ============================================================
+# 4. Detect Throw Frame Using Inputs & Outputs
+# ============================================================
+inputs_play <- inputs_all %>%
+  filter(game_id == selected_game, play_id == selected_play)
+
+outputs_play <- outputs_all %>%
+  filter(game_id == selected_game, play_id == selected_play)
+
+throw_frame <- max(inputs_play$frame_id)
+first_post_frame <- min(outputs_play$frame_id)   # e.g. usually 1
+
+# ============================================================
+# 5. QB ID & Release Location
+# ============================================================
+qb_id <- play_data %>%
+  filter(player_role == "Passer", player_side == "Offense") %>%
+  head(1) %>%
+  pull(nfl_id)
+
+release_loc <- all_frames_in_play %>%
+  filter(frame_id == throw_frame, nfl_id == qb_id) %>%
+  slice_min(1)
+
+release_x <- release_loc$x
+release_y <- release_loc$y
+
+# ---- Fix landing coordinates ----
+land_x <- inputs_play %>% pull(ball_land_x) %>% unique() %>% .[!is.na(.)]
+land_y <- inputs_play %>% pull(ball_land_y) %>% unique() %>% .[!is.na(.)]
+
+land_x <- land_x[1]   # ensure scalar
+land_y <- land_y[1]
+
+# ============================================================
+# 6. Ball Trajectory (Fixed)
+# ============================================================
+
+# ---- A. Define QB frames ----
+qb_frames <- all_frames_in_play %>%
+  filter(nfl_id == qb_id) %>%
+  select(frame_id, qb_x = x, qb_y = y)
+
+# ---- B. Pre-throw ball: ball follows QB ----
+ball_pre <- qb_frames %>%
+  filter(frame_id < throw_frame) %>%
+  transmute(
+    frame_id,
+    ball_x = qb_x,
+    ball_y = qb_y
+  )
+
+# ---- C. Release location (QB position at throw frame) ----
+release_loc <- qb_frames %>%
+  filter(frame_id == throw_frame) %>%
+  slice_min(1)
+
+release_x <- release_loc$qb_x
+release_y <- release_loc$qb_y
+
+# ---- D. Landing coordinates (from inputs_all, fixed extraction) ----
+land_x <- inputs_play %>% pull(ball_land_x) %>% unique() %>% .[!is.na(.)]
+land_y <- inputs_play %>% pull(ball_land_y) %>% unique() %>% .[!is.na(.)]
+
+land_x <- land_x[1]
+land_y <- land_y[1]
+
+# ---- E. Number of post-throw frames ----
+n_post_frames <- max_frame - throw_frame
+
+# ---- F. Post-throw ball: straight line from release → landing ----
+ball_post <- tibble(
+  frame_id = throw_frame:max_frame,
+  ball_x = seq(release_x, land_x, length.out = n_post_frames + 1),
+  ball_y = seq(release_y, land_y, length.out = n_post_frames + 1)
+)
+
+# ---- G. Combine full trajectory ----
+ball_trajectory <- bind_rows(ball_pre, ball_post) %>%
+  arrange(frame_id)
+
+# ============================================================
+# 7. Closest Defender Highlighting (Purple)
+# ============================================================
+play_offense <- all_frames_in_play %>% filter(player_side == "Offense")
+play_defense <- all_frames_in_play %>% filter(player_side == "Defense")
+targeted_receiver <- play_offense %>% filter(player_role == "Targeted Receiver")
+
+closest_defender <- play_defense %>%
+  inner_join(targeted_receiver, by = "frame_id",
+             suffix = c("_def", "_rec")) %>%
+  mutate(distance_to_receiver = sqrt((x_def - x_rec)^2 + (y_def - y_rec)^2)) %>%
+  group_by(frame_id) %>%
+  slice_min(distance_to_receiver, n = 1) %>%
+  ungroup() %>%
+  select(frame_id,
+         defender_id = nfl_id_def,
+         def_name = player_name_def,
+         def_x = x_def,
+         def_y = y_def) %>%
+  complete(frame_id = 1:max_frame) %>%
+  fill(defender_id, def_name, def_x, def_y, .direction = "down")
+
+all_frames_in_play <- all_frames_in_play %>%
+  left_join(closest_defender %>% select(frame_id, defender_id),
+            by = "frame_id") %>%
+  mutate(
+    role_color = ifelse(nfl_id == defender_id, "purple", role_color)
+  )
+
+# ============================================================
+# 8. Field Drawing
+# ============================================================
+draw_field <- function() {
+  ggplot() +
+    geom_rect(aes(xmin = 0, xmax = 120, ymin = 0, ymax = 53.3),
+              fill = "#0b6623") +
+    geom_rect(aes(xmin = 0, xmax = 10, ymin = 0, ymax = 53.3),
+              fill = "#0b3f2f", alpha = 0.5) +
+    geom_rect(aes(xmin = 110, xmax = 120, ymin = 0, ymax = 53.3),
+              fill = "#2f1f10", alpha = 0.5) +
+    geom_segment(aes(x = 0, xend = 120, y = 0, yend = 0), color = "white") +
+    geom_segment(aes(x = 0, xend = 120, y = 53.3, yend = 53.3), color = "white") +
+    geom_vline(xintercept = seq(10, 110, 10),
+               linetype = "dashed", color = "white", alpha = 0.7) +
+    coord_fixed(xlim = c(0, 120), ylim = c(0, 53.3), expand = FALSE) +
+    theme_void()
+}
+
+# ============================================================
+# Get play description
+# ============================================================
+play_desc <- supp_data %>%
+  filter(game_id == selected_game, play_id == selected_play) %>%
+  pull(play_description)
+
+# Ensure it's a single string
+play_desc <- if(length(play_desc) > 0) play_desc[1] else "No description available"
+
+# ============================================================
+# Update plot title with play description
+# ============================================================
+p <- draw_field() +
+  geom_point(
+    data = all_frames_in_play,
+    aes(x = x, y = y, color = role_color, shape = factor(shape_val), group = nfl_id),
+    size = 6, alpha = 0.85
+  ) +
+  geom_point(
+    data = ball_trajectory,
+    aes(x = ball_x, y = ball_y, group = frame_id),
+    color = "brown", size = 4, shape = 16
+  ) +
+  geom_label(
+    data = targeted_receiver,
+    aes(x = x, y = y + 3, label = player_name),
+    fill = "red", color = "white", fontface = "bold", size = 3.5
+  ) +
+  geom_label(
+    data = closest_defender,
+    aes(x = def_x, y = def_y + 3, label = def_name),
+    fill = "red", color = "white", fontface = "bold", size = 3.5
+  ) +
+  scale_color_identity() +
+  scale_shape_manual(values = c("16" = 16, "17" = 17), guide = "none") +
+  labs(title = paste0(
+    play_desc, "\n",  # top line: full play description
+    "Game: ", selected_game,
+    " | Play: ", selected_play,
+    " | Frame: {current_frame}"  # frame number on same line
+  )) +
+  transition_manual(frame_id) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,       # center horizontally
+      vjust = 1,         # vertical adjustment
+      size = 16,         # font size
+      face = "bold",     # bold
+      lineheight = 1.2   # spacing between lines
+    )
+  )
+
+# ============================================================
+# 10. Animate
+# ============================================================
+anim <- animate(
+  p, fps = 10, width = 1100, height = 600,
+  renderer = gifski_renderer("nfl_play.gif")
+)
+
+anim
+
+
+## Next steps: Add simultaneous catch% metric
+# Catch probability model
+# When in position, % DB forces incompletion/interception
+
