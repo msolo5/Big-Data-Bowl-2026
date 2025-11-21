@@ -1,0 +1,903 @@
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(readr)
+  library(stringr)
+  library(rsample)
+  library(xgboost)
+  library(tibble)
+  library(gt)
+  library(glue)
+  library(nflreadr)
+  library(ggplot2)
+  library(gganimate)
+  library(gifski)
+  library(scales)
+})
+
+set.seed(2025)
+options(nflreadr.verbose = FALSE)
+
+clip01 <- function(x) pmin(pmax(as.numeric(x), 1e-6), 1 - 1e-6)
+
+auc_fast <- function(y, p) {
+  y  <- as.integer(y)
+  p  <- as.numeric(p)
+  ok <- is.finite(p) & !is.na(y)
+  y  <- y[ok]; p <- p[ok]
+  if (!length(y) || length(unique(y)) < 2) return(NA_real_)
+  n1 <- sum(y == 1L)
+  n0 <- length(y) - n1
+  r  <- rank(p, ties.method = "average")
+  (sum(r[y == 1L]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+ap_fast <- function(y, p) {
+  y  <- as.integer(y)
+  p  <- as.numeric(p)
+  ok <- is.finite(p) & !is.na(y)
+  y  <- y[ok]; p <- p[ok]
+  if (!length(y)) return(NA_real_)
+  ord <- order(p, decreasing = TRUE)
+  y   <- y[ord]
+  k   <- seq_along(y)
+  sum(cumsum(y) / k * (y == 1L)) / max(1L, sum(y == 1L))
+}
+
+ks_fast <- function(y, p) {
+  y  <- as.integer(y)
+  p  <- as.numeric(p)
+  ok <- is.finite(p) & !is.na(y)
+  y  <- y[ok]; p <- p[ok]
+  if (!length(y) || length(unique(y)) < 2) return(NA_real_)
+  ord <- order(p, decreasing = TRUE)
+  y   <- y[ord]
+  n1  <- sum(y == 1L)
+  n0  <- length(y) - n1
+  cdf1 <- cumsum(y == 1L) / n1
+  cdf0 <- cumsum(y == 0L) / n0
+  max(abs(cdf1 - cdf0))
+}
+
+ece10 <- function(y, p) {
+  y <- as.integer(y)
+  p <- clip01(p)
+  brks <- quantile(p, probs = seq(0, 1, length.out = 11), na.rm = TRUE)
+  brks <- unique(brks)
+  if (length(brks) < 2) return(NA_real_)
+  bin <- cut(p, breaks = brks, include_lowest = TRUE, labels = FALSE)
+  df  <- tibble(y = y, p = p, bin = bin)
+  agg <- df %>%
+    filter(!is.na(bin)) %>%
+    group_by(bin) %>%
+    summarise(
+      n           = n(),
+      mean_pred   = mean(p),
+      actual_rate = mean(y),
+      .groups     = "drop"
+    )
+  sum(agg$n / sum(agg$n) * abs(agg$actual_rate - agg$mean_pred))
+}
+
+metric_block <- function(y, p) {
+  y <- as.integer(y)
+  p <- clip01(p)
+  base <- mean(y)
+  logloss <- -mean(y * log(p) + (1 - y) * log(1 - p))
+  brier <- mean((p - y)^2)
+  brier_ref <- base * (1 - base)
+  brier_skill <- 1 - brier / brier_ref
+
+  tibble(
+    BaseRate   = base,
+    LogLoss    = logloss,
+    Brier      = brier,
+    BrierSkill = brier_skill,
+    ROC_AUC    = auc_fast(y, p),
+    AP         = ap_fast(y, p),
+    KS         = ks_fast(y, p),
+    ECE10      = ece10(y, p)
+  )
+}
+
+cal_intercept <- function(y, p) {
+  y <- as.integer(y)
+  p <- clip01(p)
+  logit_p <- qlogis(p)
+  fit <- glm(y ~ 1, family = binomial(), offset = logit_p)
+  unname(coef(fit)[1])
+}
+
+best_thresholds <- function(y, p, grid = seq(0, 1, length.out = 501)) {
+  y <- as.integer(y)
+  p <- clip01(p)
+  best_f1 <- list(th = NA_real_, f1 = -Inf, prec = NA_real_, rec = NA_real_)
+  best_youden <- list(th = NA_real_, youden = -Inf, sens = NA_real_, spec = NA_real_)
+
+  for (th in grid) {
+    pred <- as.integer(p >= th)
+    tp <- sum(pred == 1L & y == 1L)
+    fp <- sum(pred == 1L & y == 0L)
+    fn <- sum(pred == 0L & y == 1L)
+    tn <- sum(pred == 0L & y == 0L)
+
+    prec <- if ((tp + fp) > 0) tp / (tp + fp) else 0
+    rec  <- if ((tp + fn) > 0) tp / (tp + fn) else 0
+    f1   <- if ((prec + rec) > 0) 2 * prec * rec / (prec + rec) else 0
+
+    sens <- if ((tp + fn) > 0) tp / (tp + fn) else 0
+    spec <- if ((tn + fp) > 0) tn / (tn + fp) else 0
+    youden <- sens + spec - 1
+
+    if (f1 > best_f1$f1) {
+      best_f1 <- list(th = th, f1 = f1, prec = prec, rec = rec)
+    }
+    if (youden > best_youden$youden) {
+      best_youden <- list(th = th, youden = youden, sens = sens, spec = spec)
+    }
+  }
+
+  list(best_f1 = best_f1, best_youden = best_youden)
+}
+
+precision_at_k <- function(y, p, ks = c(0.05, 0.10, 0.20)) {
+  ok <- is.finite(p) & !is.na(y)
+  y  <- as.integer(y[ok]); p <- as.numeric(p[ok])
+  n  <- length(y)
+  if (!n) return(tibble(k_frac = ks, k = 0L, precision = NA_real_))
+  ord <- order(p, decreasing = TRUE)
+  tibble(
+    k_frac    = ks,
+    k         = pmax(1L, pmin(n, as.integer(round(n * ks)))),
+    precision = purrr::map_dbl(
+      pmax(1L, pmin(n, as.integer(round(n * ks)))),
+      function(k){
+        idx <- ord[seq_len(k)]
+        mean(y[idx])
+      }
+    )
+  )
+}
+
+reliability_quant <- function(y, p, bins = 10) {
+  ok <- is.finite(p) & !is.na(y)
+  y  <- as.integer(y[ok]); p <- as.numeric(p[ok])
+  if (!length(y)) {
+    return(tibble(bin = integer(), n = integer(), mean_pred = numeric(),
+                  actual_rate = numeric(), abs_err = numeric()))
+  }
+  qbreaks <- as.numeric(quantile(p, probs = seq(0, 1, length.out = bins + 1), na.rm = TRUE))
+  qbreaks <- unique(qbreaks)
+  if (length(qbreaks) < 2) {
+    return(tibble(
+      bin = 1L, n = length(p),
+      mean_pred = mean(p), actual_rate = mean(y),
+      abs_err = abs(mean(y) - mean(p))
+    ))
+  }
+  if (length(qbreaks) < bins + 1) {
+    rng <- range(p, finite = TRUE)
+    ew  <- unique(seq(rng[1], rng[2], length.out = bins + 1))
+    if (length(ew) >= 2) qbreaks <- ew
+  }
+  if (length(qbreaks) < 2) qbreaks <- c(min(p), max(p))
+  fac <- cut(p, breaks = qbreaks, include_lowest = TRUE, right = TRUE)
+  df  <- tibble(bin = as.integer(fac), p = p, y = y)
+  df  <- df[!is.na(df$bin), , drop = FALSE]
+  df %>%
+    group_by(bin) %>%
+    summarise(
+      n           = n(),
+      mean_pred   = mean(p),
+      actual_rate = mean(y),
+      .groups     = "drop"
+    ) %>%
+    mutate(abs_err = abs(actual_rate - mean_pred))
+}
+
+mk_boards <- function(df_test, pred, prior_n = 200) {
+  by_def <- df_test %>%
+    mutate(pred = pred) %>%
+    group_by(defender_id, def_name) %>%
+    summarise(
+      n_plays     = n(),
+      exp_rate    = mean(pred, na.rm = TRUE),
+      actual_rate = mean(defender_within_2yds, na.rm = TRUE),
+      .groups     = "drop"
+    ) %>%
+    mutate(
+      pobe          = actual_rate - exp_rate,
+      p0            = mean(df_test$defender_within_2yds, na.rm = TRUE),
+      actual_shrunk = (n_plays * actual_rate + prior_n * p0) / (n_plays + prior_n),
+      pobe_shrunk   = actual_shrunk - exp_rate
+    )
+
+  pick_min_n <- function(tbl, target = 50L) {
+    for (m in c(target, 40L, 30L, 25L, 20L, 15L, 10L, 5L, 1L)) {
+      if (nrow(filter(tbl, n_plays >= m)) >= 20) return(m)
+    }
+    1L
+  }
+
+  min_n <- pick_min_n(by_def, 50L)
+
+  list(
+    min_n     = min_n,
+    top20_raw = by_def %>% filter(n_plays >= min_n) %>% arrange(desc(pobe))        %>% slice_head(n = 20),
+    bot20_raw = by_def %>% filter(n_plays >= min_n) %>% arrange(pobe)              %>% slice_head(n = 20),
+    top20_shr = by_def %>% filter(n_plays >= min_n) %>% arrange(desc(pobe_shrunk)) %>% slice_head(n = 20),
+    bot20_shr = by_def %>% filter(n_plays >= min_n) %>% arrange(pobe_shrunk)       %>% slice_head(n = 20)
+  )
+}
+
+fmt_pobo_table_raw <- function(tbl, title, subtitle = "Raw POBOE") {
+  tbl %>%
+    transmute(
+      Defender      = def_name,
+      Coverage_Reps = n_plays,
+      Actual        = actual_rate,
+      Expected      = expected_rate,
+      POBOE         = pobe
+    ) %>%
+    gt() %>%
+    fmt_percent(columns = c(Actual, Expected, POBOE), decimals = 2) %>%
+    tab_header(title = md(glue("**{title}**")), subtitle = md(subtitle))
+}
+
+fmt_pobo_table_shr <- function(tbl, title, subtitle = "EB-shrunk POBOE") {
+  tbl %>%
+    transmute(
+      Defender      = def_name,
+      Coverage_Reps = n_plays,
+      Shrunk        = actual_shrunk,
+      Expected      = expected_rate,
+      POBOE         = pobe_shrunk
+    ) %>%
+    gt() %>%
+    fmt_percent(columns = c(Shrunk, Expected, POBOE), decimals = 2) %>%
+    tab_header(title = md(glue("**{title}**")), subtitle = md(subtitle))
+}
+
+distance_rec_to_ball_max <- 5
+
+read_weeks <- function(dir, prefix, weeks = 1:18) {
+  paths <- file.path(dir, sprintf("%s_2023_w%02d.csv", prefix, weeks))
+  paths <- paths[file.exists(paths)]
+  if (!length(paths)) stop("No files found")
+  purrr::map_dfr(paths, readr::read_csv, show_col_types = FALSE)
+}
+
+inputs_all  <- read_weeks("train", "input",  1:18)
+outputs_all <- read_weeks("train", "output", 1:18)
+
+supp_data <- readr::read_csv(
+  "~/Downloads/114239_nfl_competition_files_published_analytics_final/supplementary_data.csv",
+  show_col_types = FALSE
+)
+
+pre_throw <- inputs_all %>%
+  group_by(game_id, play_id, nfl_id) %>%
+  filter(frame_id == max(frame_id)) %>%
+  ungroup() %>%
+  rename(before_pass_x = x, before_pass_y = y)
+
+post_throw <- outputs_all %>%
+  group_by(game_id, play_id, nfl_id) %>%
+  filter(frame_id == max(frame_id)) %>%
+  ungroup() %>%
+  rename(after_pass_x = x, after_pass_y = y)
+
+targeted_receivers_pre <- pre_throw %>%
+  filter(player_role == "Targeted Receiver")
+
+rec_ids <- targeted_receivers_pre %>%
+  transmute(game_id, play_id, rec_id = nfl_id)
+
+def_pre <- pre_throw %>%
+  filter(player_side == "Defense") %>%
+  transmute(
+    game_id, play_id, frame_id,
+    defender_id         = nfl_id,
+    def_player_position = player_position,
+    def_before_pass_x   = before_pass_x,
+    def_before_pass_y   = before_pass_y,
+    def_s = s, def_a = a, def_dir = dir, def_o = o,
+    def_name = player_name,
+    ball_land_x, ball_land_y
+  )
+
+def_post <- post_throw %>%
+  transmute(
+    game_id, play_id,
+    defender_id      = nfl_id,
+    def_after_pass_x = after_pass_x,
+    def_after_pass_y = after_pass_y
+  )
+
+rec_post <- post_throw %>%
+  inner_join(rec_ids, by = c("game_id","play_id","nfl_id" = "rec_id")) %>%
+  transmute(
+    game_id, play_id,
+    rec_after_pass_x = after_pass_x,
+    rec_after_pass_y = after_pass_y
+  )
+
+cd <- def_pre %>%
+  left_join(def_post, by = c("game_id","play_id","defender_id")) %>%
+  left_join(rec_post, by = c("game_id","play_id")) %>%
+  group_by(game_id, play_id) %>%
+  mutate(
+    ball_land_x = first(ball_land_x),
+    ball_land_y = first(ball_land_y)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    distance_def_to_ball = sqrt((def_after_pass_x - ball_land_x)^2 +
+                                  (def_after_pass_y - ball_land_y)^2),
+    distance_rec_to_ball = sqrt((rec_after_pass_x - ball_land_x)^2 +
+                                  (rec_after_pass_y - ball_land_y)^2)
+  ) %>%
+  filter(
+    is.finite(distance_def_to_ball),
+    is.na(distance_rec_to_ball) | distance_rec_to_ball <= distance_rec_to_ball_max
+  ) %>%
+  group_by(game_id, play_id) %>%
+  slice_min(distance_def_to_ball, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(defender_within_2yds = as.integer(distance_def_to_ball <= 2)) %>%
+  select(
+    game_id, play_id, defender_id, def_name, def_player_position,
+    def_before_pass_x, def_before_pass_y, def_s, def_a, def_dir, def_o,
+    rec_after_pass_x, rec_after_pass_y, distance_def_to_ball,
+    distance_rec_to_ball, ball_land_x, ball_land_y, defender_within_2yds
+  )
+
+rec_pre <- targeted_receivers_pre %>%
+  transmute(
+    game_id, play_id,
+    rec_before_pass_x = before_pass_x,
+    rec_before_pass_y = before_pass_y
+  )
+
+feat_pre <- def_pre %>%
+  left_join(rec_pre, by = c("game_id","play_id")) %>%
+  mutate(
+    dist_def_to_rec_pre = sqrt(
+      (def_before_pass_x - rec_before_pass_x)^2 +
+        (def_before_pass_y - rec_before_pass_y)^2
+    )
+  ) %>%
+  select(
+    game_id, play_id, defender_id, def_name, def_player_position,
+    def_before_pass_x, def_before_pass_y, def_s, def_a, def_dir, def_o,
+    dist_def_to_rec_pre
+  )
+
+base_labs <- cd %>%
+  select(game_id, play_id, defender_id, defender_within_2yds)
+
+model_data <- base_labs %>%
+  left_join(feat_pre,  by = c("game_id","play_id","defender_id")) %>%
+  left_join(supp_data, by = c("game_id","play_id")) %>%
+  filter(def_player_position %in% c("SS","FS","S","CB"))
+
+df <- model_data %>%
+  select(
+    game_id, play_id, defender_id, def_name, def_player_position,
+    def_before_pass_x, def_before_pass_y, def_s, def_a,
+    dist_def_to_rec_pre,
+    down, yards_to_go, pass_length, dropback_distance,
+    team_coverage_type, defenders_in_the_box, pass_location_type,
+    defender_within_2yds
+  ) %>%
+  filter(!is.na(defender_within_2yds)) %>%
+  mutate(defender_within_2yds = as.integer(defender_within_2yds))
+
+if (!"coverage_mz" %in% names(df)) {
+  if ("team_coverage_type" %in% names(df)) {
+    covtmp <- case_when(
+      str_detect(tolower(df$team_coverage_type), "man")  ~ "Man",
+      str_detect(tolower(df$team_coverage_type), "zone") ~ "Zone",
+      TRUE ~ "Other"
+    )
+  } else {
+    covtmp <- rep("Other", nrow(df))
+  }
+  df$coverage_mz <- covtmp
+}
+
+fac_cols_all <- intersect(
+  c("team_coverage_type", "pass_location_type", "coverage_mz"),
+  names(df)
+)
+
+num_feats <- c(
+  "def_before_pass_x","def_before_pass_y","def_s","def_a",
+  "dist_def_to_rec_pre","down","yards_to_go","pass_length",
+  "dropback_distance","defenders_in_the_box"
+)
+
+glm_formula <- as.formula(
+  "defender_within_2yds ~ def_s + def_a + dist_def_to_rec_pre +
+   down + yards_to_go + defenders_in_the_box + coverage_mz +
+   pass_length + dropback_distance"
+)
+
+plays   <- df %>% distinct(game_id, play_id)
+split   <- initial_split(plays, prop = 0.75)
+train_ids <- training(split)
+test_ids  <- testing(split)
+
+train_df <- df %>% inner_join(train_ids, by = c("game_id","play_id"))
+test_df  <- df %>% inner_join(test_ids,  by = c("game_id","play_id"))
+
+train_glm <- train_df %>%
+  mutate(across(any_of(fac_cols_all), as.factor))
+test_glm  <- test_df %>%
+  mutate(across(any_of(fac_cols_all), as.factor))
+
+glm_model <- glm(glm_formula, data = train_glm, family = binomial())
+pred_glm_test <- as.numeric(predict(glm_model, newdata = test_glm, type = "response"))
+y_test <- as.integer(test_df$defender_within_2yds)
+
+one_hot <- function(d, num_feats, fac_cols) {
+  nr <- nrow(d)
+  num_df <- d %>%
+    mutate(across(any_of(num_feats), as.numeric)) %>%
+    select(any_of(num_feats))
+  num <- if (ncol(num_df) == 0) matrix(numeric(0), nrow = nr, ncol = 0) else as.matrix(num_df)
+  fac_cols <- intersect(fac_cols, names(d))
+  fac_mats <- lapply(fac_cols, function(cc){
+    vals <- as.character(d[[cc]])
+    vals[is.na(vals) | vals == "" | vals == "NaN"] <- "__NA__"
+    levs <- sort(unique(vals))
+    mm   <- do.call(cbind, lapply(levs, function(lv) as.integer(vals == lv)))
+    colnames(mm) <- paste0(cc, "_", make.names(levs))
+    storage.mode(mm) <- "numeric"
+    mm
+  })
+  mats <- c(list(num), fac_mats)
+  if (length(mats) == 0) out <- matrix(numeric(0), nrow = nr, ncol = 0)
+  else if (length(mats) == 1) out <- mats[[1]]
+  else out <- do.call(cbind, mats)
+  out[is.na(out)] <- 0
+  out
+}
+
+align_cols <- function(train_mat, test_mat) {
+  cn  <- union(colnames(train_mat), colnames(test_mat))
+  pad <- function(m) {
+    miss <- setdiff(cn, colnames(m))
+    if (length(miss)) {
+      m <- cbind(m, matrix(0, nrow = nrow(m), ncol = length(miss),
+                           dimnames = list(NULL, miss)))
+    }
+    m[, cn, drop = FALSE]
+  }
+  list(train = pad(train_mat), test = pad(test_mat))
+}
+
+fac_cols_xgb <- intersect(fac_cols_all, names(train_df))
+X_train_raw <- one_hot(train_df, num_feats = num_feats, fac_cols = fac_cols_xgb)
+X_test_raw  <- one_hot(test_df,  num_feats = num_feats, fac_cols = fac_cols_xgb)
+al      <- align_cols(X_train_raw, X_test_raw)
+X_train <- al$train
+X_test  <- al$test
+
+y_train <- as.integer(train_df$defender_within_2yds)
+dtrain  <- xgb.DMatrix(data = X_train, label = y_train)
+dtest   <- xgb.DMatrix(data = X_test,  label = y_test)
+
+params <- list(
+  objective        = "binary:logistic",
+  eval_metric      = "logloss",
+  eta              = 0.05,
+  max_depth        = 6,
+  subsample        = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 5
+)
+
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 2000,
+  watchlist = list(eval = dtest),
+  early_stopping_rounds = 50,
+  verbose = 0
+)
+
+pred_xgb_test <- as.numeric(predict(xgb_model, dtest))
+pred_xgb_test[!is.finite(pred_xgb_test)] <- mean(y_train, na.rm = TRUE)
+
+b0 <- cal_intercept(y_test, pred_xgb_test)
+pred_xgb_test_cal <- plogis(qlogis(clip01(pred_xgb_test)) + b0)
+pred_xgb_test_cal <- clip01(pred_xgb_test_cal)
+
+met_glm <- metric_block(y_test, pred_glm_test) %>%
+  mutate(Model = "GLM") %>%
+  select(Model, everything())
+
+met_xgb <- metric_block(y_test, pred_xgb_test_cal) %>%
+  mutate(Model = "XGB (cal)") %>%
+  select(Model, everything())
+
+metrics_tbl <- bind_rows(met_glm, met_xgb)
+
+bt_glm <- best_thresholds(y_test, pred_glm_test)
+bt_xgb <- best_thresholds(y_test, pred_xgb_test_cal)
+
+pak_glm <- precision_at_k(y_test, pred_glm_test)
+pak_xgb <- precision_at_k(y_test, pred_xgb_test_cal)
+
+rel_glm <- reliability_quant(y_test, pred_glm_test, bins = 10)
+rel_xgb <- reliability_quant(y_test, pred_xgb_test_cal, bins = 10)
+
+boards_glm <- mk_boards(test_df %>% mutate(defender_within_2yds = y_test), pred_glm_test)
+boards_xgb <- mk_boards(test_df %>% mutate(defender_within_2yds = y_test), pred_xgb_test_cal)
+
+glm_top_raw_tbl <- boards_glm$top20_raw %>% rename(expected_rate = exp_rate) %>%
+  fmt_pobo_table_raw("Top 20 POBOE — GLM")
+xgb_top_raw_tbl <- boards_xgb$top20_raw %>% rename(expected_rate = exp_rate) %>%
+  fmt_pobo_table_raw("Top 20 POBOE — XGB (cal)")
+
+test_df_pred <- test_df %>%
+  mutate(prob_xgb_cal = pred_xgb_test_cal) %>%
+  select(game_id, play_id, defender_id, def_name, defender_within_2yds, prob_xgb_cal)
+
+cd_with_probs <- cd %>%
+  left_join(
+    test_df_pred,
+    by = c("game_id","play_id","defender_id"),
+    suffix = c("_cd", "_test")
+  ) %>%
+  mutate(
+    def_name = dplyr::coalesce(def_name_cd, def_name_test),
+    defender_within_2yds = dplyr::coalesce(defender_within_2yds_cd, defender_within_2yds_test)
+  ) %>%
+  select(
+    game_id, play_id, defender_id, def_name, defender_within_2yds,
+    prob_xgb_cal, dplyr::everything()
+  )
+
+test_eval <- test_df %>%
+  mutate(
+    prob_xgb_cal   = pred_xgb_test_cal,
+    pos_group = dplyr::case_when(
+      def_player_position == "CB" ~ "CB",
+      def_player_position %in% c("S","FS","SS") ~ "S",
+      TRUE ~ "Other"
+    ),
+    coverage_group = coverage_mz
+  )
+
+metrics_by_pos_cov <- test_eval %>%
+  group_by(pos_group, coverage_group) %>%
+  summarise(
+    n         = n(),
+    base_rate = mean(defender_within_2yds),
+    auc       = auc_fast(defender_within_2yds, prob_xgb_cal),
+    brier     = mean((clip01(prob_xgb_cal) - defender_within_2yds)^2),
+    .groups   = "drop"
+  ) %>%
+  arrange(pos_group, coverage_group)
+
+metrics_cb_s_mz <- metrics_by_pos_cov %>%
+  filter(
+    pos_group %in% c("CB","S"),
+    coverage_group %in% c("Man","Zone")
+  ) %>%
+  arrange(pos_group, coverage_group)
+
+cd_cb_s_mz <- cd_with_probs %>%
+  inner_join(
+    test_eval %>%
+      filter(
+        pos_group %in% c("CB","S"),
+        coverage_group %in% c("Man","Zone")
+      ) %>%
+      select(game_id, play_id, defender_id, pos_group, coverage_group),
+    by = c("game_id","play_id","defender_id")
+  ) %>%
+  filter(!is.na(prob_xgb_cal))
+
+pick_examples_cb_s_mz <- function(dat) {
+  dat %>%
+    group_by(pos_group, coverage_group) %>%
+    summarise(
+      ex_hit_game_id = game_id[which.max(ifelse(defender_within_2yds == 1, prob_xgb_cal, -Inf))],
+      ex_hit_play_id = play_id[which.max(ifelse(defender_within_2yds == 1, prob_xgb_cal, -Inf))],
+      ex_hit_prob    = max(ifelse(defender_within_2yds == 1, prob_xgb_cal, NA_real_), na.rm = TRUE),
+      ex_miss_game_id = game_id[which.max(ifelse(defender_within_2yds == 0, prob_xgb_cal, -Inf))],
+      ex_miss_play_id = play_id[which.max(ifelse(defender_within_2yds == 0, prob_xgb_cal, -Inf))],
+      ex_miss_prob    = max(ifelse(defender_within_2yds == 0, prob_xgb_cal, NA_real_), na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      ex_hit_prob  = ifelse(is.infinite(ex_hit_prob),  NA_real_, ex_hit_prob),
+      ex_miss_prob = ifelse(is.infinite(ex_miss_prob), NA_real_, ex_miss_prob)
+    )
+}
+
+examples_cb_s_mz <- pick_examples_cb_s_mz(cd_cb_s_mz)
+
+all_frames <- inputs_all %>%
+  group_by(game_id, play_id, nfl_id) %>%
+  mutate(max_input_frame = max(frame_id)) %>%
+  ungroup() %>%
+  bind_rows(
+    outputs_all %>%
+      left_join(
+        inputs_all %>%
+          group_by(game_id, play_id, nfl_id) %>%
+          summarise(max_input_frame = max(frame_id), .groups = "drop"),
+        by = c("game_id","play_id","nfl_id")
+      ) %>%
+      mutate(frame_id = frame_id + max_input_frame)
+  ) %>%
+  select(-max_input_frame) %>%
+  arrange(game_id, play_id, nfl_id, frame_id)
+
+draw_field <- function() {
+  ggplot() +
+    geom_rect(aes(xmin = 0, xmax = 120, ymin = 0, ymax = 53.3),
+              fill = "#0b6623") +
+    geom_rect(aes(xmin = 0, xmax = 10, ymin = 0, ymax = 53.3),
+              fill = "#0b3f2f", alpha = 0.5) +
+    geom_rect(aes(xmin = 110, xmax = 120, ymin = 0, ymax = 53.3),
+              fill = "#2f1f10", alpha = 0.5) +
+    geom_segment(aes(x = 0, xend = 120, y = 0, yend = 0), color = "white") +
+    geom_segment(aes(x = 0, xend = 120, y = 53.3, yend = 53.3), color = "white") +
+    geom_vline(xintercept = seq(10, 110, 10),
+               linetype = "dashed", color = "white", alpha = 0.7) +
+    coord_fixed(xlim = c(0, 120), ylim = c(0, 53.3), expand = FALSE) +
+    theme_void()
+}
+
+animate_play_pobe <- function(game_id_sel, play_id_sel, out_path = NULL, fps = 10) {
+  play_data <- all_frames %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel) %>%
+    arrange(frame_id, nfl_id)
+
+  if (!nrow(play_data)) stop("No frames found for this (game_id, play_id).")
+
+  max_frame <- max(play_data$frame_id)
+
+  role_colors <- c(
+    "Passer"            = "orange",
+    "Targeted Receiver" = "limegreen",
+    "Other Route Runner"= "yellow",
+    "Defensive Coverage"= "blue",
+    "Football"          = "brown"
+  )
+
+  play_data <- play_data %>%
+    mutate(
+      role_color = role_colors[player_role],
+      shape_val  = ifelse(player_side == "Offense", 16, 17)
+    )
+
+  all_frames_in_play <- play_data %>%
+    group_by(nfl_id) %>%
+    complete(frame_id = 1:max_frame) %>%
+    fill(
+      x, y, role_color, shape_val, player_side, player_role, player_name,
+      ball_land_x, ball_land_y,
+      .direction = "down"
+    ) %>%
+    ungroup()
+
+  inputs_play <- inputs_all %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel)
+
+  outputs_play <- outputs_all %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel)
+
+  throw_frame <- max(inputs_play$frame_id)
+
+  qb_id <- play_data %>%
+    filter(player_role == "Passer", player_side == "Offense") %>%
+    slice(1) %>%
+    pull(nfl_id)
+
+  qb_frames <- all_frames_in_play %>%
+    filter(nfl_id == qb_id) %>%
+    select(frame_id, qb_x = x, qb_y = y)
+
+  release_loc <- qb_frames %>%
+    filter(frame_id == throw_frame) %>%
+    slice(1)
+
+  release_x <- release_loc$qb_x
+  release_y <- release_loc$qb_y
+
+  land_x <- inputs_play$ball_land_x[!is.na(inputs_play$ball_land_x)][1]
+  land_y <- inputs_play$ball_land_y[!is.na(inputs_play$ball_land_y)][1]
+
+  n_post_frames <- max_frame - throw_frame
+
+  ball_pre <- qb_frames %>%
+    filter(frame_id < throw_frame) %>%
+    transmute(frame_id, ball_x = qb_x, ball_y = qb_y)
+
+  ball_post <- tibble(
+    frame_id = throw_frame:max_frame,
+    ball_x = seq(release_x, land_x, length.out = n_post_frames + 1),
+    ball_y = seq(release_y, land_y, length.out = n_post_frames + 1)
+  )
+
+  ball_trajectory <- bind_rows(ball_pre, ball_post) %>%
+    arrange(frame_id)
+
+  targeted_receiver <- all_frames_in_play %>%
+    filter(player_role == "Targeted Receiver")
+
+  cand <- cd_with_probs %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel) %>%
+    slice(1)
+
+  cd_id   <- cand$defender_id
+  cd_name <- cand$def_name
+  cd_prob <- cand$prob_xgb_cal
+
+  all_frames_in_play <- all_frames_in_play %>%
+    mutate(
+      role_color = ifelse(nfl_id == cd_id, "purple", role_color)
+    )
+
+  cd_labels <- all_frames_in_play %>%
+    filter(nfl_id == cd_id) %>%
+    group_by(frame_id) %>%
+    slice(1) %>%
+    ungroup() %>%
+    mutate(label = cd_name)
+
+  play_desc <- supp_data %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel) %>%
+    pull(play_description)
+
+  if (!length(play_desc)) play_desc <- "No description available"
+  play_desc <- play_desc[1]
+
+  prob_text <- if (!is.na(cd_prob)) {
+    paste0("Model P(POB ≤ 2 yds) = ", scales::percent(cd_prob, accuracy = 0.1))
+  } else {
+    "Model probability unavailable (train split or OOS play)"
+  }
+
+  p <- draw_field() +
+    geom_point(
+      data = all_frames_in_play,
+      aes(x = x, y = y, color = role_color,
+          shape = factor(shape_val), group = nfl_id),
+      size = 4, alpha = 0.85
+    ) +
+    geom_point(
+      data = ball_trajectory,
+      aes(x = ball_x, y = ball_y, group = frame_id),
+      color = "brown", size = 3, shape = 16
+    ) +
+    geom_label(
+      data = targeted_receiver %>%
+        group_by(frame_id) %>% slice(1) %>% ungroup(),
+      aes(x = x, y = y + 3, label = player_name),
+      fill = "red", color = "white", fontface = "bold", size = 3
+    ) +
+    geom_label(
+      data = cd_labels,
+      aes(x = x, y = y + 3, label = label),
+      fill = "purple", color = "white", fontface = "bold", size = 3
+    ) +
+    scale_color_identity() +
+    scale_shape_manual(values = c("16" = 16, "17" = 17), guide = "none") +
+    labs(
+      title = paste0(
+        play_desc, "\n",
+        "Game: ", game_id_sel,
+        " | Play: ", play_id_sel,
+        " | Frame: {current_frame}"
+      ),
+      subtitle = prob_text
+    ) +
+    transition_manual(frame_id) +
+    theme(
+      plot.title = element_text(
+        hjust = 0.5, vjust = 1,
+        size = 14, face = "bold", lineheight = 1.2
+      ),
+      plot.subtitle = element_text(hjust = 0.5, size = 11)
+    )
+
+  if (is.null(out_path)) {
+    animate(
+      p, fps = fps, width = 1100, height = 600,
+      renderer = gifski_renderer()
+    )
+  } else {
+    animate(
+      p, fps = fps, width = 1100, height = 600,
+      renderer = gifski_renderer(out_path)
+    )
+  }
+}
+
+inspect_pob_play <- function(game_id_sel, play_id_sel) {
+  cand <- cd_with_probs %>%
+    dplyr::filter(game_id == game_id_sel,
+                  play_id == play_id_sel)
+
+  if (nrow(cand) == 0) {
+    message("No cd_with_probs row found for this (game_id, play_id).")
+    return(invisible(NULL))
+  }
+  cand <- cand[1, , drop = FALSE]
+
+  out_play <- outputs_all %>%
+    dplyr::filter(game_id == game_id_sel,
+                  play_id == play_id_sel)
+
+  if (!nrow(out_play)) {
+    message("No outputs_all rows found for this (game_id, play_id).")
+    return(invisible(NULL))
+  }
+
+  final_frame <- max(out_play$frame_id, na.rm = TRUE)
+
+  in_play <- inputs_all %>%
+    dplyr::filter(game_id == game_id_sel,
+                  play_id == play_id_sel)
+
+  if (!nrow(in_play)) {
+    message("No inputs_all rows found for this (game_id, play_id).")
+    return(invisible(NULL))
+  }
+
+  ball_land_x <- in_play$ball_land_x[!is.na(in_play$ball_land_x)]
+  ball_land_y <- in_play$ball_land_y[!is.na(in_play$ball_land_y)]
+
+  if (!length(ball_land_x) || !length(ball_land_y)) {
+    message("No non-NA ball_land_x/ball_land_y found for this play.")
+    return(invisible(NULL))
+  }
+
+  ball_land_x <- ball_land_x[1]
+  ball_land_y <- ball_land_y[1]
+
+  def_final <- out_play %>%
+    dplyr::filter(frame_id == final_frame) %>%
+    dplyr::left_join(
+      inputs_all %>%
+        dplyr::select(game_id, play_id, nfl_id,
+                      player_side, player_name, player_position) %>%
+        dplyr::distinct(),
+      by = c("game_id", "play_id", "nfl_id")
+    ) %>%
+    dplyr::filter(player_side == "Defense") %>%
+    dplyr::mutate(
+      dist_def_to_ball = sqrt((x - ball_land_x)^2 +
+                                (y - ball_land_y)^2),
+      is_cd_candidate  = nfl_id == cand$defender_id
+    ) %>%
+    dplyr::arrange(dist_def_to_ball) %>%
+    dplyr::mutate(rank_by_dist = dplyr::row_number()) %>%
+    dplyr::select(
+      rank_by_dist,
+      nfl_id, player_name, player_position,
+      dist_def_to_ball, is_cd_candidate
+    )
+
+  message("=== cd POB candidate for this play ===")
+  print(
+    cand %>%
+      dplyr::select(
+        game_id, play_id, defender_id, def_name,
+        defender_within_2yds, prob_xgb_cal
+      )
+  )
+
+  message("\n=== All defenders at final frame, sorted by distance to ball ===")
+  print(def_final)
+
+  invisible(list(candidate = cand, defenders_final = def_final))
+}
