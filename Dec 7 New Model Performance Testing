@@ -1,0 +1,264 @@
+pr_auc_manual <- function(y, p) {
++     o <- order(p, decreasing = TRUE)
++     y_sorted <- y[o]
++     p_sorted <- p[o]
++     tp <- cumsum(y_sorted == 1)
++     fp <- cumsum(y_sorted == 0)
++     P  <- sum(y_sorted == 1)
++     if (P == 0) return(NA_real_)
++     recall    <- tp / P
++     precision <- tp / (tp + fp)
++     recall    <- c(0, recall)
++     precision <- c(1, precision)
++     sum((recall[-1] - recall[-length(recall)]) * precision[-1])
++ }
+> 
+> binary_eval <- function(y, p, model_name = "raw") {
++     y <- as.numeric(y)
++     p <- as.numeric(p)
++     eps <- 1e-15
++     p_clip <- pmin(pmax(p, eps), 1 - eps)
++     base_rate <- mean(y)
++     brier     <- mean((p - y)^2)
++     logloss   <- -mean(
++         y * log(p_clip) +
++             (1 - y) * log(1 - p_clip)
++     )
++     roc_obj <- tryCatch(
++         pROC::roc(y, p, quiet = TRUE),
++         error = function(e) NULL
++     )
++     auc_roc <- if (!is.null(roc_obj)) as.numeric(pROC::auc(roc_obj)) else NA_real_
++     auc_pr <- pr_auc_manual(y, p)
++     pred_class <- as.integer(p >= 0.5)
++     tp <- sum(pred_class == 1 & y == 1)
++     fp <- sum(pred_class == 1 & y == 0)
++     tn <- sum(pred_class == 0 & y == 0)
++     fn <- sum(pred_class == 0 & y == 1)
++     acc <- (tp + tn) / length(y)
++     prec <- if ((tp + fp) > 0) tp / (tp + fp) else NA_real_
++     rec  <- if ((tp + fn) > 0) tp / (tp + fn) else NA_real_
++     f1   <- if (!is.na(prec) && !is.na(rec) && (prec + rec) > 0) {
++         2 * prec * rec / (prec + rec)
++     } else {
++         NA_real_
++     }
++     tpr <- if ((tp + fn) > 0) tp / (tp + fn) else NA_real_
++     tnr <- if ((tn + fp) > 0) tn / (tn + fp) else NA_real_
++     bal_acc <- mean(c(tpr, tnr), na.rm = TRUE)
++     dplyr::tibble(
++         model     = model_name,
++         base_rate = base_rate,
++         brier     = brier,
++         logloss   = logloss,
++         auc_roc   = auc_roc,
++         auc_pr    = auc_pr,
++         accuracy  = acc,
++         precision = prec,
++         recall    = rec,
++         f1        = f1,
++         bal_acc   = bal_acc
++     )
++ }
+> 
+> reliability_table <- function(y, p, bins = 10, model_name = "raw") {
++     df <- dplyr::tibble(y = as.numeric(y), p = as.numeric(p)) %>%
++         dplyr::mutate(
++             bin = cut(
++                 p,
++                 breaks = seq(0, 1, length.out = bins + 1),
++                 include.lowest = TRUE
++             )
++         ) %>%
++         dplyr::group_by(bin) %>%
++         dplyr::summarise(
++             n      = dplyr::n(),
++             mean_p = mean(p),
++             rate_y = mean(y),
++             .groups = "drop"
++         ) %>%
++         dplyr::mutate(model = model_name)
++     df
++ }
+> 
+> eval_by_group <- function(df, pos_vec, group_name, prob_col, model_name) {
++     sub <- df %>%
++         dplyr::filter(def_player_position %in% pos_vec)
++     if (!nrow(sub)) {
++         return(dplyr::tibble())
++     }
++     res <- binary_eval(
++         y          = sub$defender_within_2yds,
++         p          = sub[[prob_col]],
++         model_name = model_name
++     )
++     res$group <- group_name
++     res
++ }
+> 
+> metrics_overall <- dplyr::bind_rows(
++     binary_eval(y_test, pred_test_raw,    model_name = "raw"),
++     binary_eval(y_test, frame_test$p_cal, model_name = "calibrated")
++ )
+> 
+> reliab_overall <- dplyr::bind_rows(
++     reliability_table(y_test, pred_test_raw,    bins = 10, model_name = "raw"),
++     reliability_table(y_test, frame_test$p_cal, bins = 10, model_name = "calibrated")
++ )
+> 
+> ggplot2::ggplot(
++     reliab_overall %>% dplyr::filter(model == "calibrated"),
++     ggplot2::aes(x = mean_p, y = rate_y)
++ ) +
++     ggplot2::geom_point() +
++     ggplot2::geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
++     ggplot2::labs(
++         x = "Predicted probability (bin mean)",
++         y = "Observed frequency",
++         title = "Calibration (test set, calibrated model)"
++     )
+> 
+> cal_xgb_dist_test <- frame_test %>%
++     dplyr::mutate(
++         dist_bin = cut(
++             dist_to_ball,
++             breaks = c(0, 1, 2, 3, 5, 10, Inf),
++             include.lowest = TRUE
++         )
++     ) %>%
++     dplyr::group_by(dist_bin) %>%
++     dplyr::summarise(
++         n      = dplyr::n(),
++         obs    = sum(defender_within_2yds),
++         exp    = sum(p_cal),
++         rate_y = obs / n,
++         rate_p = exp / n,
++         .groups = "drop"
++     )
+> 
+> frame_test_pos <- frame_test %>%
++     dplyr::inner_join(
++         cd %>%
++             dplyr::select(
++                 game_id, play_id,
++                 defender_id,
++                 def_name,
++                 def_player_position
++             ),
++         by = c("game_id","play_id","nfl_id" = "defender_id")
++     )
+> 
+> cb_positions <- c("CB")
+> s_positions  <- c("S","FS","SS")
+> lb_positions <- c("LB","ILB","OLB","MLB")
+> 
+> metrics_by_pos <- dplyr::bind_rows(
++     binary_eval(
++         frame_test_pos$defender_within_2yds,
++         frame_test_pos$p_raw,
++         model_name = "raw"
++     ) %>% dplyr::mutate(group = "All"),
++     binary_eval(
++         frame_test_pos$defender_within_2yds,
++         frame_test_pos$p_cal,
++         model_name = "calibrated"
++     ) %>% dplyr::mutate(group = "All"),
++     eval_by_group(frame_test_pos, cb_positions, "CB",      "p_raw", "raw"),
++     eval_by_group(frame_test_pos, cb_positions, "CB",      "p_cal", "calibrated"),
++     eval_by_group(frame_test_pos, s_positions,  "S/FS/SS", "p_raw", "raw"),
++     eval_by_group(frame_test_pos, s_positions,  "S/FS/SS", "p_cal", "calibrated"),
++     eval_by_group(frame_test_pos, lb_positions, "LB",      "p_raw", "raw"),
++     eval_by_group(frame_test_pos, lb_positions, "LB",      "p_cal", "calibrated")
++ )
+> 
+> frame_prob_by_throw_test <- frame_test %>%
++     dplyr::group_by(frame_rel_throw) %>%
++     dplyr::summarise(
++         n      = dplyr::n(),
++         mean_p = mean(p_cal, na.rm = TRUE),
++         p25    = stats::quantile(p_cal, 0.25, na.rm = TRUE),
++         med    = stats::median(p_cal, na.rm = TRUE),
++         p75    = stats::quantile(p_cal, 0.75, na.rm = TRUE),
++         .groups = "drop"
++     )
+> 
+> ggplot2::ggplot(frame_prob_by_throw_test,
++                 ggplot2::aes(x = frame_rel_throw, y = mean_p)) +
++     ggplot2::geom_line() +
++     ggplot2::labs(
++         x = "Frame relative to throw",
++         y = "Mean calibrated probability",
++         title = "Probability to be within 2 yards vs. frame (test set)"
++     )
+> 
+> print(metrics_overall)
+# A tibble: 2 × 11
+  model    base_rate brier logloss auc_roc auc_pr accuracy precision recall    f1
+  <chr>        <dbl> <dbl>   <dbl>   <dbl>  <dbl>    <dbl>     <dbl>  <dbl> <dbl>
+1 raw          0.274 0.176   0.529   0.713  0.479    0.745     0.608  0.193 0.293
+2 calibra…     0.274 0.176   0.528   0.713  0.479    0.744     0.609  0.189 0.288
+# ℹ 1 more variable: bal_acc <dbl>
+> 
+> print(metrics_by_pos)
+# A tibble: 8 × 12
+  model    base_rate brier logloss auc_roc auc_pr accuracy precision recall    f1
+  <chr>        <dbl> <dbl>   <dbl>   <dbl>  <dbl>    <dbl>     <dbl>  <dbl> <dbl>
+1 raw          0.274 0.176   0.529   0.713  0.479    0.745     0.608  0.193 0.293
+2 calibra…     0.274 0.176   0.528   0.713  0.479    0.744     0.609  0.189 0.288
+3 raw          0.328 0.198   0.577   0.701  0.511    0.696     0.601  0.220 0.322
+4 calibra…     0.328 0.198   0.579   0.701  0.511    0.696     0.601  0.216 0.318
+5 raw          0.274 0.181   0.542   0.684  0.459    0.741     0.628  0.140 0.229
+6 calibra…     0.274 0.181   0.543   0.684  0.459    0.741     0.631  0.137 0.225
+7 raw          0.177 0.134   0.432   0.743  0.412    0.833     0.614  0.160 0.254
+8 calibra…     0.177 0.133   0.427   0.743  0.412    0.833     0.614  0.154 0.246
+# ℹ 2 more variables: bal_acc <dbl>, group <chr>
+> 
+> print(cal_xgb_dist_test)
+# A tibble: 6 × 6
+  dist_bin     n   obs    exp rate_y rate_p
+  <fct>    <int> <int>  <dbl>  <dbl>  <dbl>
+1 [0,1]      103    30   31.2  0.291  0.303
+2 (1,2]      330    96  125.   0.291  0.380
+3 (2,3]      673   235  240.   0.349  0.357
+4 (3,5]     3207  1023 1026.   0.319  0.320
+5 (5,10]   12309  2509 2592.   0.204  0.211
+6 (10,Inf]  9414  3246 3125.   0.345  0.332
+> 
+> print(head(reliab_overall, 20))
+# A tibble: 18 × 5
+   bin           n mean_p rate_y model     
+   <fct>     <int>  <dbl>  <dbl> <chr>     
+ 1 [0,0.1]    1931 0.0780 0.0466 raw       
+ 2 (0.1,0.2]  6871 0.150  0.145  raw       
+ 3 (0.2,0.3]  6341 0.251  0.237  raw       
+ 4 (0.3,0.4]  5943 0.346  0.336  raw       
+ 5 (0.4,0.5]  2686 0.442  0.438  raw       
+ 6 (0.5,0.6]  1194 0.545  0.583  raw       
+ 7 (0.6,0.7]   676 0.646  0.593  raw       
+ 8 (0.7,0.8]   334 0.742  0.707  raw       
+ 9 (0.8,0.9]    60 0.820  0.733  raw       
+10 [0,0.1]    2648 0.0756 0.0551 calibrated
+11 (0.1,0.2]  6978 0.148  0.157  calibrated
+12 (0.2,0.3]  6343 0.251  0.254  calibrated
+13 (0.3,0.4]  5438 0.346  0.342  calibrated
+14 (0.4,0.5]  2419 0.442  0.446  calibrated
+15 (0.5,0.6]  1122 0.545  0.584  calibrated
+16 (0.6,0.7]   660 0.646  0.594  calibrated
+17 (0.7,0.8]   351 0.743  0.689  calibrated
+18 (0.8,0.9]    77 0.824  0.740  calibrated
+> 
+> print(head(frame_prob_by_throw_test, 20))
+# A tibble: 11 × 6
+   frame_rel_throw     n mean_p   p25   med   p75
+             <dbl> <int>  <dbl> <dbl> <dbl> <dbl>
+ 1             -10  2366  0.272 0.157 0.257 0.357
+ 2              -9  2367  0.274 0.158 0.261 0.356
+ 3              -8  2367  0.277 0.160 0.263 0.359
+ 4              -7  2367  0.278 0.159 0.260 0.358
+ 5              -6  2367  0.275 0.157 0.254 0.358
+ 6              -5  2367  0.274 0.154 0.254 0.359
+ 7              -4  2367  0.274 0.156 0.254 0.359
+ 8              -3  2367  0.273 0.147 0.249 0.357
+ 9              -2  2367  0.272 0.144 0.250 0.358
+10              -1  2367  0.272 0.136 0.246 0.364
+11               0  2367  0.275 0.136 0.255 0.371
