@@ -1,0 +1,336 @@
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(Matrix)
+  library(xgboost)
+  library(rsample)
+  library(readr)
+})
+
+ensure_core_data <- function() {
+  needed <- c("cd", "cd_frames", "all_frames", "throw_land")
+  if (all(vapply(needed, exists, logical(1)))) {
+    message("Core data already in memory: cd, cd_frames, all_frames, throw_land.")
+    return(invisible(TRUE))
+  }
+  
+  rdata_candidates <- c(
+    "Big Data Bowl Dec 7.RData",
+    "Dec 7 Big Data Bowl 2.RData",
+    "Big Data Bowl Nov 29.RData",
+    "Nov 18 Big Data Bowl.RData",
+    "NFL Big Data Bowl Analytics Oct 31.RData",
+    "Big Data Bowl Oct 9.RData",
+    ".RData"
+  )
+  rdata_candidates <- rdata_candidates[file.exists(rdata_candidates)]
+  
+  if (!length(rdata_candidates)) {
+    stop(
+      "No .RData files found that might contain cd / cd_frames / all_frames / throw_land.\n",
+      "Either load them manually or run your original prep script first."
+    )
+  }
+  
+  for (f in rdata_candidates) {
+    env_tmp <- new.env()
+    load(f, envir = env_tmp)
+    if (all(c("cd", "cd_frames", "all_frames", "throw_land") %in% ls(env_tmp))) {
+      list2env(as.list(env_tmp)[c("cd", "cd_frames", "all_frames", "throw_land")],
+               envir = .GlobalEnv)
+      message("Loaded core data (cd, cd_frames, all_frames, throw_land) from: ", f)
+      return(invisible(TRUE))
+    }
+  }
+  
+  stop(
+    "Could not find cd, cd_frames, all_frames, throw_land in any .RData file.\n",
+    "Open the project where you created them, save an .RData with those objects, ",
+    "then re-run this script."
+  )
+}
+
+ensure_core_data()
+
+frame_window_min <- -8L
+frame_window_max <- 0L
+
+cd_frame_df <- cd_frames %>%
+  dplyr::filter(
+    frame_rel_throw >= frame_window_min,
+    frame_rel_throw <= frame_window_max
+  ) %>%
+  dplyr::arrange(game_id, play_id, nfl_id, frame_id)
+
+cd_frame_feat <- cd_frame_df %>%
+  dplyr::left_join(throw_land, by = c("game_id", "play_id")) %>%
+  dplyr::left_join(
+    all_frames %>%
+      dplyr::select(game_id, play_id, nfl_id, frame_id, x, y, dir, o),
+    by = c("game_id", "play_id", "nfl_id", "frame_id")
+  ) %>%
+  dplyr::mutate(
+    time_to_arrival = -frame_rel_throw / 10,
+    dx              = land_x - x,
+    dy              = land_y - y,
+    dist_to_ball    = sqrt(dx^2 + dy^2),
+    angle_to_ball   = atan2(dy, dx),
+    orient_rad      = o * pi / 180,
+    heading_error   = atan2(
+      sin(angle_to_ball - orient_rad),
+      cos(angle_to_ball - orient_rad)
+    ),
+    is_post_throw   = as.integer(frame_rel_throw > 0)
+  ) %>%
+  dplyr::select(
+    game_id, play_id, nfl_id, frame_id,
+    defender_within_2yds,
+    frame_rel_throw,
+    dist_to_ball,
+    def_s, def_a,
+    time_to_arrival,
+    is_post_throw,
+    angle_to_ball,
+    heading_error
+  ) %>%
+  dplyr::filter(stats::complete.cases(.))
+
+set.seed(2025)
+
+unique_plays <- cd_frame_feat %>%
+  dplyr::distinct(game_id, play_id)
+
+play_split <- rsample::initial_split(unique_plays, prop = 0.8)
+train_plays <- rsample::training(play_split)
+test_plays  <- rsample::testing(play_split)
+
+frame_train <- cd_frame_feat %>%
+  dplyr::inner_join(train_plays, by = c("game_id", "play_id"))
+frame_test <- cd_frame_feat %>%
+  dplyr::inner_join(test_plays,  by = c("game_id", "play_id"))
+
+y_train <- frame_train$defender_within_2yds
+y_test  <- frame_test$defender_within_2yds
+
+X_train <- Matrix::sparse.model.matrix(
+  defender_within_2yds ~ frame_rel_throw +
+    dist_to_ball +
+    def_s + def_a +
+    time_to_arrival +
+    is_post_throw +
+    angle_to_ball +
+    heading_error,
+  data = frame_train
+)[, -1]
+
+X_test <- Matrix::sparse.model.matrix(
+  defender_within_2yds ~ frame_rel_throw +
+    dist_to_ball +
+    def_s + def_a +
+    time_to_arrival +
+    is_post_throw +
+    angle_to_ball +
+    heading_error,
+  data = frame_test
+)[, -1]
+
+unique_train_plays <- frame_train %>%
+  dplyr::distinct(game_id, play_id)
+
+inner_split <- rsample::initial_split(unique_train_plays, prop = 0.8)
+inner_train_plays <- rsample::training(inner_split)
+inner_val_plays   <- rsample::testing(inner_split)
+
+frame_train_inner <- frame_train %>%
+  dplyr::inner_join(inner_train_plays, by = c("game_id", "play_id"))
+frame_val_inner <- frame_train %>%
+  dplyr::inner_join(inner_val_plays,   by = c("game_id", "play_id"))
+
+y_train_inner <- frame_train_inner$defender_within_2yds
+y_val_inner   <- frame_val_inner$defender_within_2yds
+
+X_train_inner <- Matrix::sparse.model.matrix(
+  defender_within_2yds ~ frame_rel_throw +
+    dist_to_ball +
+    def_s + def_a +
+    time_to_arrival +
+    is_post_throw +
+    angle_to_ball +
+    heading_error,
+  data = frame_train_inner
+)[, -1]
+
+X_val_inner <- Matrix::sparse.model.matrix(
+  defender_within_2yds ~ frame_rel_throw +
+    dist_to_ball +
+    def_s + def_a +
+    time_to_arrival +
+    is_post_throw +
+    angle_to_ball +
+    heading_error,
+  data = frame_val_inner
+)[, -1]
+
+dtrain_inner <- xgboost::xgb.DMatrix(data = X_train_inner, label = y_train_inner)
+dval_inner   <- xgboost::xgb.DMatrix(data = X_val_inner,   label = y_val_inner)
+
+dtrain_full  <- xgboost::xgb.DMatrix(data = X_train, label = y_train)
+dtest_outer  <- xgboost::xgb.DMatrix(data = X_test,  label = y_test)
+
+param_grid <- expand.grid(
+  max_depth        = c(3L, 4L, 5L),
+  eta              = c(0.03, 0.05),
+  min_child_weight = c(5, 10),
+  subsample        = c(0.8),
+  colsample_bytree = c(0.8),
+  KEEP.OUT.ATTRS   = FALSE,
+  stringsAsFactors = FALSE
+)
+
+tune_results <- purrr::pmap_dfr(
+  param_grid,
+  function(max_depth, eta, min_child_weight, subsample, colsample_bytree) {
+    params <- list(
+      objective        = "binary:logistic",
+      eval_metric      = "logloss",
+      max_depth        = max_depth,
+      eta              = eta,
+      subsample        = subsample,
+      colsample_bytree = colsample_bytree,
+      min_child_weight = min_child_weight,
+      lambda           = 1
+    )
+    watch_inner <- list(train = dtrain_inner, eval = dval_inner)
+    m <- xgboost::xgb.train(
+      params                = params,
+      data                  = dtrain_inner,
+      nrounds               = 600,
+      watchlist             = watch_inner,
+      early_stopping_rounds = 30,
+      verbose               = 0
+    )
+    tibble::tibble(
+      max_depth        = max_depth,
+      eta              = eta,
+      min_child_weight = min_child_weight,
+      subsample        = subsample,
+      colsample_bytree = colsample_bytree,
+      best_iter        = m$best_iteration,
+      best_logloss     = m$best_score
+    )
+  }
+)
+
+best_row <- tune_results %>%
+  dplyr::arrange(best_logloss) %>%
+  dplyr::slice(1)
+
+print(tune_results %>% dplyr::arrange(best_logloss))
+
+best_params <- list(
+  objective        = "binary:logistic",
+  eval_metric      = "logloss",
+  max_depth        = best_row$max_depth[[1]],
+  eta              = best_row$eta[[1]],
+  subsample        = best_row$subsample[[1]],
+  colsample_bytree = best_row$colsample_bytree[[1]],
+  min_child_weight = best_row$min_child_weight[[1]],
+  lambda           = 1
+)
+
+watch_outer <- list(train = dtrain_full, eval = dtest_outer)
+
+xgb_frame <- xgboost::xgb.train(
+  params                = best_params,
+  data                  = dtrain_full,
+  nrounds               = best_row$best_iter[[1]],
+  watchlist             = watch_outer,
+  early_stopping_rounds = 30,
+  verbose               = 1
+)
+
+pred_test_raw <- predict(xgb_frame, dtest_outer)
+
+clip01 <- function(x) pmin(pmax(as.numeric(x), 1e-6), 1 - 1e-6)
+
+y_test_vec <- as.integer(y_test)
+p_test_cl  <- clip01(pred_test_raw)
+
+base_rate <- mean(y_test_vec)
+brier     <- mean((p_test_cl - y_test_vec)^2)
+logloss   <- -mean(
+  y_test_vec * log(p_test_cl) +
+    (1 - y_test_vec) * log(1 - p_test_cl)
+)
+
+cat("\nFrame model (window -8 to 0) test metrics:\n")
+cat(sprintf("  Base rate: %.4f\n", base_rate))
+cat(sprintf("  Brier:     %.6f\n", brier))
+cat(sprintf("  Logloss:   %.6f\n", logloss))
+
+logit_test <- qlogis(clip01(pred_test_raw))
+
+cal_df_xgb <- data.frame(
+  y      = y_test_vec,
+  logitp = logit_test
+)
+
+cal_model_xgb <- stats::glm(
+  y ~ logitp,
+  data   = cal_df_xgb,
+  family = stats::binomial()
+)
+
+cal_intercept <- unname(cal_model_xgb$coefficients[1])
+cal_slope     <- unname(cal_model_xgb$coefficients[2])
+
+cat("\nCalibration (y ~ logit(p)):\n")
+cat(sprintf("  Intercept: %.6f\n", cal_intercept))
+cat(sprintf("  Slope:     %.6f\n", cal_slope))
+
+cd_frame_feat_all <- cd_frame_feat %>%
+  dplyr::mutate(row_id = dplyr::row_number())
+
+X_all <- Matrix::sparse.model.matrix(
+  defender_within_2yds ~ frame_rel_throw +
+    dist_to_ball +
+    def_s + def_a +
+    time_to_arrival +
+    is_post_throw +
+    angle_to_ball +
+    heading_error,
+  data = cd_frame_feat_all
+)[, -1]
+
+dall <- xgboost::xgb.DMatrix(data = X_all)
+
+p_all_raw <- predict(xgb_frame, dall)
+logit_all <- qlogis(clip01(p_all_raw))
+
+cd_frame_feat_all <- cd_frame_feat_all %>%
+  dplyr::mutate(
+    prob_reach_frame_xgb = plogis(cal_intercept + cal_slope * logit_all)
+  )
+
+cd_frame_df_out <- cd_frame_feat_all %>%
+  dplyr::select(
+    game_id, play_id, nfl_id, frame_id,
+    frame_rel_throw, dist_to_ball,
+    def_s, def_a,
+    defender_within_2yds,
+    prob_reach_frame_xgb
+  )
+
+if (!dir.exists("models")) dir.create("models", showWarnings = FALSE)
+
+saveRDS(xgb_frame, file.path("models", "xgb_frame_m8_0.rds"))
+saveRDS(
+  list(intercept = cal_intercept, slope = cal_slope),
+  file.path("models", "xgb_frame_m8_0_calibration.rds")
+)
+saveRDS(cd_frame_df_out, file.path("models", "cd_frame_probs_xgb_m8_0.rds"))
+
+cat("\nSaved:\n")
+cat("  models/xgb_frame_m8_0.rds\n")
+cat("  models/xgb_frame_m8_0_calibration.rds\n")
+cat("  models/cd_frame_probs_xgb_m8_0.rds\n")
+
