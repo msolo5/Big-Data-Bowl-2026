@@ -1,0 +1,54 @@
+# Identify primary defenders (INPUTS ONLY)
+primary_defenders <- inputs_all |>
+  filter(player_to_predict == TRUE, player_side == "Defense") |>
+  select(game_id, play_id, defender_id = nfl_id) |>
+  distinct()
+
+# Identify targeted receiver (INPUTS ONLY)
+targeted_receivers <- inputs_all |>
+  filter(player_role == "Targeted Receiver") |>
+  select(game_id, play_id, rec_id = nfl_id) |>
+  distinct()
+
+# Get ALL FRAMES for the primary defender
+defender_frames <- all_frames |>
+  inner_join(
+    primary_defenders,
+    by = c("game_id", "play_id", "nfl_id" = "defender_id")
+  ) |>
+  rename(
+    defender_id = nfl_id,
+    def_x = x,
+    def_y = y
+  )
+
+# Get ALL FRAMES for the targeted receiver
+receiver_frames <- all_frames |>
+  inner_join(
+    targeted_receivers,
+    by = c("game_id", "play_id", "nfl_id" = "rec_id")
+  ) |>
+  rename(
+    rec_id = nfl_id,
+    rec_x = x,
+    rec_y = y
+  )
+
+# Attach receiver X/Y to every defender frame
+closest_defender_df <- defender_frames |>
+  left_join(
+    receiver_frames |>
+      select(game_id, play_id, frame_id, rec_x, rec_y),
+    by = c("game_id", "play_id", "frame_id")
+  ) |>
+  mutate(
+    dist_to_rec = sqrt((def_x - rec_x)^2 + (def_y - rec_y)^2),
+    in_phase = dist_to_rec <= 2
+  ) |>
+  arrange(game_id, play_id, frame_id)
+
+# Add supplementary play-level data
+if (exists("supp_data")) {
+  closest_defender_df <- closest_defender_df |>
+    left_join(supp_data, by = c("game_id", "play_id"))
+}
