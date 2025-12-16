@@ -862,3 +862,46 @@ for (pos in c("CB","S","LB")) {
 }
 
 check_carlton_opp(def_summary_play_poscal, expected = 115)
+def_summary_play_poscal_25 <- play_def_df_poscal %>%
+  +     group_by(nfl_id, def_name, def_player_position, pos_group) %>%
+  +     summarise(
+    +         Opportunities = n(),
+    +         Successes = sum(label),
+    +         Exp_success_rate = mean(exp_prob),
+    +         Success_rate = mean(label),
+    +         num = sum(label - exp_prob),
+    +         den = sqrt(sum(exp_prob * (1 - exp_prob))),
+    +         z = num / pmax(den, 1e-12),
+    +         .groups = "drop"
+    +     ) %>%
+  +     mutate(
+    +         POE = Success_rate - Exp_success_rate,
+    +         shrink_n = shrink_n_viz,
+    +         shrink_w = Opportunities / (Opportunities + shrink_n_viz),
+    +         POE_shr = shrink_w * POE,
+    +         POE_pp = 100 * POE,
+    +         POE_pp_shr = 100 * POE_shr,
+    +         Success_pct = 100 * Success_rate,
+    +         Exp_success_pct = 100 * Exp_success_rate
+    +     )
+> 
+  > viz_df <- def_summary_play_poscal_25 %>%
+    +     transmute(
+      +         nfl_id,
+      +         player = coalesce(def_name, as.character(nfl_id)),
+      +         pos = def_player_position,
+      +         pos_group,
+      +         Opportunities,
+      +         Successes,
+      +         Success_pct = round(Success_pct, 1),
+      +         Exp_success_pct = round(Exp_success_pct, 1),
+      +         POE_pp = round(POE_pp, 2),
+      +         POE_pp_shr = round(POE_pp_shr, 2),
+      +         z = round(z, 3),
+      +         shrink_n,
+      +         shrink_w = round(shrink_w, 3)
+      +     )
+    > dir.create("viz", showWarnings = FALSE, recursive = TRUE)
+  > write.csv(viz_df, "viz/def_leaderboard_poscal_shr25.csv", row.names = FALSE)
+  > saveRDS(viz_df, "viz/def_leaderboard_poscal_shr25.rds")
+  > 
