@@ -1,0 +1,864 @@
+req_pkgs <- c("dplyr","tibble","readr","rsample","Matrix","xgboost","pROC","stats")
+to_install <- req_pkgs[!vapply(req_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(to_install) > 0) install.packages(to_install, repos = "https://cloud.r-project.org")
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(rsample)
+  library(Matrix)
+  library(xgboost)
+  library(pROC)
+})
+
+clip01 <- function(x) pmin(pmax(as.numeric(x), 1e-6), 1 - 1e-6)
+
+eps_prob <- 1e-6
+safe_qlogis <- function(p) qlogis(pmin(pmax(p, eps_prob), 1 - eps_prob))
+safe_plogis <- function(x) plogis(pmin(pmax(x, -20), 20))
+
+maybe_dir <- function(path) {
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  invisible(path)
+}
+
+require_cols <- function(df, cols, df_name = "df") {
+  miss <- setdiff(cols, names(df))
+  if (length(miss)) {
+    stop(
+      df_name, " missing required columns: ", paste(miss, collapse = ", "),
+      "\nAvailable columns: ", paste(names(df), collapse = ", ")
+    )
+  }
+  invisible(TRUE)
+}
+
+read_weeks <- function(train_dir, prefix, weeks = 1:18, year = 2023) {
+  paths <- file.path(train_dir, sprintf("%s_%d_w%02d.csv", prefix, year, weeks))
+  paths <- paths[file.exists(paths)]
+  if (!length(paths)) stop("No files found for prefix=", prefix, " in ", train_dir)
+  dplyr::bind_rows(lapply(paths, function(p) readr::read_csv(p, show_col_types = FALSE)))
+}
+
+add_missing_cols <- function(df, cols) {
+  for (cc in cols) if (!cc %in% names(df)) df[[cc]] <- NA
+  df
+}
+
+make_core_data_from_raw_v1 <- function(
+    project_dir = ".",
+    train_dir = "train",
+    year = 2023,
+    weeks = 1:18,
+    within_yards = 2,
+    use_cache = TRUE,
+    cache_path = "data/core_objects_v1.rds"
+) {
+  old <- getwd()
+  on.exit(setwd(old), add = TRUE)
+  setwd(project_dir)
+  
+  maybe_dir(dirname(cache_path))
+  
+  if (use_cache && file.exists(cache_path)) {
+    core <- readRDS(cache_path)
+    return(core)
+  }
+  
+  inputs_all  <- read_weeks(train_dir, "input",  weeks, year)
+  outputs_all <- read_weeks(train_dir, "output", weeks, year)
+  
+  require_cols(inputs_all, c("game_id","play_id","frame_id","nfl_id","x","y","s","a","dir","o"), "inputs_all")
+  require_cols(outputs_all, c("game_id","play_id","nfl_id","frame_id","x","y"), "outputs_all")
+  
+  if (!"player_to_predict" %in% names(inputs_all)) inputs_all$player_to_predict <- NA
+  
+  inputs_all <- inputs_all %>%
+    mutate(
+      player_to_predict = dplyr::case_when(
+        is.logical(player_to_predict) ~ player_to_predict,
+        is.numeric(player_to_predict) ~ player_to_predict == 1,
+        TRUE ~ as.character(player_to_predict) %in% c("TRUE","T","1","true","True")
+      )
+    )
+  
+  if (all(c("ball_land_x","ball_land_y") %in% names(inputs_all))) {
+    throw_land <- inputs_all %>%
+      transmute(game_id, play_id, land_x = ball_land_x, land_y = ball_land_y) %>%
+      filter(!is.na(land_x), !is.na(land_y)) %>%
+      distinct(game_id, play_id, .keep_all = TRUE)
+  } else {
+    supp_candidates <- c(
+      file.path(project_dir, "supplementary_data.csv"),
+      file.path(project_dir, "data", "supplementary_data.csv")
+    )
+    supp_path <- supp_candidates[file.exists(supp_candidates)][1]
+    if (is.na(supp_path)) stop("Could not find supplementary_data.csv in project root or data/")
+    supp <- readr::read_csv(supp_path, show_col_types = FALSE)
+    require_cols(supp, c("game_id","play_id","ball_land_x","ball_land_y"), "supplementary_data")
+    throw_land <- supp %>%
+      transmute(game_id, play_id, land_x = ball_land_x, land_y = ball_land_y) %>%
+      filter(!is.na(land_x), !is.na(land_y)) %>%
+      distinct(game_id, play_id, .keep_all = TRUE)
+  }
+  
+  out_last <- outputs_all %>%
+    filter(!is.na(frame_id)) %>%
+    group_by(game_id, play_id, nfl_id) %>%
+    slice_max(frame_id, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    transmute(game_id, play_id, nfl_id, out_x = x, out_y = y)
+  
+  cd <- out_last %>%
+    left_join(throw_land, by = c("game_id","play_id")) %>%
+    mutate(
+      dist_final_to_land = sqrt((out_x - land_x)^2 + (out_y - land_y)^2),
+      defender_within_2yds = as.integer(dist_final_to_land <= within_yards)
+    ) %>%
+    select(game_id, play_id, nfl_id, defender_within_2yds)
+  
+  opt_cols <- c("player_name","player_position","player_side","player_role")
+  inputs_all2 <- add_missing_cols(inputs_all, opt_cols)
+  
+  all_frames <- inputs_all2 %>%
+    transmute(
+      game_id, play_id, nfl_id, frame_id,
+      x, y, s, a, dir, o,
+      player_to_predict,
+      player_name, player_position, player_side, player_role
+    )
+  
+  cd_frames <- all_frames %>%
+    filter(player_to_predict %in% TRUE) %>%
+    group_by(game_id, play_id, nfl_id) %>%
+    mutate(frame_rel_throw = as.integer(frame_id - max(frame_id, na.rm = TRUE))) %>%
+    ungroup() %>%
+    left_join(cd, by = c("game_id","play_id","nfl_id")) %>%
+    transmute(
+      game_id, play_id, nfl_id, frame_id,
+      defender_within_2yds, frame_rel_throw,
+      def_s = s, def_a = a
+    )
+  
+  core <- list(
+    cd = cd,
+    cd_frames = cd_frames,
+    all_frames = all_frames,
+    throw_land = throw_land
+  )
+  
+  saveRDS(core, cache_path)
+  core
+}
+
+build_cd_frame_feat_full_v1 <- function(core, feat_cache_path = "data/cd_frame_feat_full_v1.rds", overwrite = FALSE) {
+  maybe_dir(dirname(feat_cache_path))
+  
+  if (file.exists(feat_cache_path) && !overwrite) {
+    return(readRDS(feat_cache_path))
+  }
+  
+  cd_frames <- core$cd_frames
+  all_frames <- core$all_frames
+  throw_land <- core$throw_land
+  
+  xyo <- all_frames %>%
+    select(game_id, play_id, nfl_id, frame_id, x, y, dir, o) %>%
+    distinct(game_id, play_id, nfl_id, frame_id, .keep_all = TRUE)
+  
+  cd_frame_feat_full <- cd_frames %>%
+    left_join(throw_land, by = c("game_id","play_id")) %>%
+    left_join(xyo, by = c("game_id","play_id","nfl_id","frame_id")) %>%
+    mutate(
+      time_to_arrival = -frame_rel_throw / 10,
+      dx = land_x - x,
+      dy = land_y - y,
+      dist_to_ball = sqrt(dx^2 + dy^2),
+      angle_to_ball = atan2(dy, dx),
+      orient_rad = o * pi / 180,
+      heading_error = atan2(sin(angle_to_ball - orient_rad), cos(angle_to_ball - orient_rad))
+    ) %>%
+    select(
+      game_id, play_id, nfl_id, frame_id,
+      defender_within_2yds, frame_rel_throw,
+      dist_to_ball, def_s, def_a,
+      time_to_arrival, angle_to_ball, heading_error
+    ) %>%
+    filter(stats::complete.cases(.))
+  
+  saveRDS(cd_frame_feat_full, feat_cache_path)
+  cd_frame_feat_full
+}
+
+train_frame_model_v1_m6_0 <- function(
+    cd_frame_feat_full,
+    frame_window_min = -6L,
+    frame_window_max = 0L,
+    seed = 2025,
+    model_dir = "models"
+) {
+  maybe_dir(model_dir)
+  
+  cd_frame_feat <- cd_frame_feat_full %>%
+    filter(frame_rel_throw >= frame_window_min, frame_rel_throw <= frame_window_max) %>%
+    arrange(game_id, play_id, nfl_id, frame_id)
+  
+  set.seed(seed)
+  
+  unique_plays <- cd_frame_feat %>% distinct(game_id, play_id)
+  
+  outer <- rsample::initial_split(unique_plays, prop = 0.8)
+  train_plays <- rsample::training(outer)
+  test_plays  <- rsample::testing(outer)
+  
+  inner <- rsample::initial_split(train_plays, prop = 0.8)
+  fit_plays <- rsample::training(inner)
+  val_plays <- rsample::testing(inner)
+  
+  df_fit  <- cd_frame_feat %>% inner_join(fit_plays, by = c("game_id","play_id"))
+  df_val  <- cd_frame_feat %>% inner_join(val_plays, by = c("game_id","play_id"))
+  df_test <- cd_frame_feat %>% inner_join(test_plays, by = c("game_id","play_id"))
+  
+  form <- defender_within_2yds ~ frame_rel_throw + dist_to_ball + def_s + def_a + time_to_arrival + angle_to_ball + heading_error
+  
+  X_fit  <- Matrix::sparse.model.matrix(form, data = df_fit)[, -1]
+  X_val  <- Matrix::sparse.model.matrix(form, data = df_val)[, -1]
+  X_test <- Matrix::sparse.model.matrix(form, data = df_test)[, -1]
+  
+  dfit <- xgboost::xgb.DMatrix(X_fit,  label = df_fit$defender_within_2yds)
+  dval <- xgboost::xgb.DMatrix(X_val,  label = df_val$defender_within_2yds)
+  dtes <- xgboost::xgb.DMatrix(X_test, label = df_test$defender_within_2yds)
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    max_depth = 4,
+    eta = 0.05,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    min_child_weight = 10,
+    lambda = 1
+  )
+  
+  xgb_frame <- xgboost::xgb.train(
+    params = params,
+    data = dfit,
+    nrounds = 2000,
+    watchlist = list(train = dfit, eval = dval),
+    early_stopping_rounds = 50,
+    verbose = 1
+  )
+  
+  best_iter <- xgb_frame$best_iteration
+  
+  p_test_raw <- clip01(predict(xgb_frame, dtes))
+  y_test <- as.integer(df_test$defender_within_2yds)
+  
+  logloss_raw <- -mean(y_test * log(p_test_raw) + (1 - y_test) * log(1 - p_test_raw))
+  brier_raw <- mean((p_test_raw - y_test)^2)
+  
+  p_val_raw <- clip01(predict(xgb_frame, dval))
+  logit_val <- qlogis(p_val_raw)
+  
+  cal_model <- tryCatch(
+    stats::glm(as.integer(df_val$defender_within_2yds) ~ logit_val, family = stats::binomial()),
+    error = function(e) NULL
+  )
+  
+  if (is.null(cal_model) || any(!is.finite(stats::coef(cal_model)))) {
+    cal_intercept <- qlogis(mean(df_val$defender_within_2yds))
+    cal_slope <- 1
+  } else {
+    cal_intercept <- unname(stats::coef(cal_model)[1])
+    cal_slope <- unname(stats::coef(cal_model)[2])
+  }
+  
+  p_test_cal <- clip01(plogis(cal_intercept + cal_slope * qlogis(p_test_raw)))
+  logloss_cal <- -mean(y_test * log(p_test_cal) + (1 - y_test) * log(1 - p_test_cal))
+  brier_cal <- mean((p_test_cal - y_test)^2)
+  
+  metrics <- tibble::tibble(
+    logloss_raw = logloss_raw,
+    brier_raw = brier_raw,
+    logloss = logloss_cal,
+    brier = brier_cal,
+    cal_slope = cal_slope,
+    cal_intercept = cal_intercept,
+    best_iter = best_iter,
+    n_test = length(y_test),
+    base_rate = mean(y_test)
+  )
+  
+  X_all <- Matrix::sparse.model.matrix(form, data = cd_frame_feat)[, -1]
+  dall <- xgboost::xgb.DMatrix(X_all)
+  p_all_raw <- clip01(predict(xgb_frame, dall))
+  p_all_cal <- clip01(plogis(cal_intercept + cal_slope * qlogis(p_all_raw)))
+  
+  cd_frame_probs <- cd_frame_feat %>%
+    mutate(prob_reach_frame_xgb = p_all_cal) %>%
+    select(game_id, play_id, nfl_id, frame_id, frame_rel_throw, defender_within_2yds, prob_reach_frame_xgb)
+  
+  saveRDS(xgb_frame, file.path(model_dir, "xgb_frame_v1_m6_0.rds"))
+  saveRDS(
+    list(
+      intercept = cal_intercept,
+      slope = cal_slope,
+      best_iter = best_iter,
+      window_min = frame_window_min,
+      window_max = frame_window_max
+    ),
+    file.path(model_dir, "xgb_frame_v1_m6_0_calibration.rds")
+  )
+  saveRDS(cd_frame_probs, file.path(model_dir, "cd_frame_probs_xgb_v1_m6_0.rds"))
+  saveRDS(metrics, file.path(model_dir, "metrics_xgb_v1_m6_0.rds"))
+  
+  list(model = xgb_frame, metrics = metrics, probs = cd_frame_probs)
+}
+
+infer_pos_map_v1 <- function(core) {
+  all_frames <- core$all_frames
+  cd_frames <- core$cd_frames
+  
+  if (!"player_name" %in% names(all_frames)) all_frames$player_name <- NA
+  if (!"player_position" %in% names(all_frames)) all_frames$player_position <- NA
+  
+  ids <- unique(cd_frames$nfl_id)
+  
+  all_frames %>%
+    filter(nfl_id %in% ids) %>%
+    arrange(game_id, play_id, frame_id) %>%
+    group_by(nfl_id) %>%
+    summarise(
+      def_name = dplyr::coalesce(dplyr::first(stats::na.omit(player_name)), NA_character_),
+      def_player_position = dplyr::coalesce(dplyr::first(stats::na.omit(player_position)), NA_character_),
+      .groups = "drop"
+    )
+}
+
+pos_group_from_position <- function(pos) {
+  pos <- toupper(as.character(pos))
+  dplyr::case_when(
+    pos %in% c("CB") ~ "CB",
+    pos %in% c("S","FS","SS") ~ "S",
+    grepl("LB", pos) | pos %in% c("ILB","OLB","MLB") ~ "LB",
+    TRUE ~ "Other"
+  )
+}
+
+eval_play_simple <- function(df) {
+  y <- df$label
+  p <- pmin(pmax(df$exp_prob, eps_prob), 1 - eps_prob)
+  brier   <- mean((y - p)^2)
+  logloss <- -mean(y*log(p) + (1-y)*log(1-p))
+  aucv    <- as.numeric(pROC::auc(y, p))
+  tibble(n=nrow(df), base_y=mean(y), base_p=mean(p), brier=brier, logloss=logloss, auc=aucv)
+}
+
+eval_play_by_group <- function(df, group_col = "pos_group") {
+  df %>%
+    group_by(.data[[group_col]]) %>%
+    group_modify(~eval_play_simple(.x)) %>%
+    ungroup() %>%
+    rename(!!group_col := .data[[group_col]])
+}
+
+reliability_bins <- function(y, p, bins = 10) {
+  tibble(y=y, p=p) %>%
+    mutate(p = pmin(pmax(p, eps_prob), 1 - eps_prob)) %>%
+    mutate(bin = ntile(p, bins)) %>%
+    group_by(bin) %>%
+    summarise(n=n(), mean_p=mean(p), mean_y=mean(y), .groups="drop") %>%
+    arrange(bin)
+}
+
+lift_table_fixed <- function(y, p, bins = 10) {
+  base <- mean(y)
+  tibble(y=y, p=p) %>%
+    mutate(p = pmin(pmax(p, eps_prob), 1 - eps_prob)) %>%
+    mutate(bin = ntile(desc(p), bins)) %>%
+    group_by(bin) %>%
+    summarise(
+      n = n(),
+      mean_p = mean(p),
+      mean_y = mean(y),
+      lift = mean_y / base,
+      .groups = "drop"
+    ) %>%
+    arrange(bin)
+}
+
+cal_slope_intercept <- function(df) {
+  fit <- glm(label ~ safe_qlogis(exp_prob), data = df, family = binomial())
+  tibble(cal_intercept = coef(fit)[1], cal_slope = coef(fit)[2])
+}
+
+play_p0_from_frames_keep_split <- function(frame_df) {
+  if (!("frame_rel_throw" %in% names(frame_df))) stop("frame_rel_throw column missing.")
+  frame_df %>%
+    filter(frame_rel_throw == 0L) %>%
+    group_by(game_id, play_id, nfl_id, def_name, def_player_position, pos_group) %>%
+    summarise(
+      exp_prob = mean(exp_prob, na.rm = TRUE),
+      label    = max(label, na.rm = TRUE),
+      split    = dplyr::first(split),
+      .groups  = "drop"
+    )
+}
+
+fit_pos_group_calibrators <- function(play_train, groups = c("CB","S","LB")) {
+  out <- vector("list", length(groups))
+  names(out) <- groups
+  for (g in groups) {
+    df_g <- play_train %>% filter(pos_group == g)
+    if (nrow(df_g) < 200 || length(unique(df_g$label)) < 2) {
+      out[[g]] <- NULL
+    } else {
+      out[[g]] <- glm(label ~ safe_qlogis(exp_prob), data = df_g, family = binomial())
+    }
+  }
+  out
+}
+
+apply_pos_group_calibrators <- function(play_df, pos_cals, out_col = "exp_prob_poscal") {
+  play_df %>%
+    mutate(
+      "{out_col}" := {
+        p <- pmin(pmax(exp_prob, eps_prob), 1 - eps_prob)
+        g <- pos_group
+        vapply(seq_along(p), function(i) {
+          cal <- pos_cals[[g[[i]]]]
+          if (is.null(cal)) return(p[[i]])
+          safe_plogis(coef(cal)[1] + coef(cal)[2] * safe_qlogis(p[[i]]))
+        }, numeric(1))
+      }
+    )
+}
+
+summarize_def_play <- function(play_def_df, shrink_n = 50) {
+  play_def_df %>%
+    group_by(nfl_id, def_name, def_player_position, pos_group) %>%
+    summarise(
+      Opportunities = n(),
+      Successes = sum(label),
+      Exp_success_rate = mean(exp_prob),
+      Success_rate = mean(label),
+      num = sum(label - exp_prob),
+      den = sqrt(sum(exp_prob*(1-exp_prob))),
+      z = num / pmax(den, 1e-12),
+      .groups="drop"
+    ) %>%
+    mutate(
+      POE = Success_rate - Exp_success_rate,
+      shrink_w = Opportunities / (Opportunities + shrink_n),
+      POE_shr = shrink_w * POE,
+      success_rate_shr = Exp_success_rate + POE_shr,
+      POE_pp = 100 * POE,
+      POE_pp_shr = 100 * POE_shr,
+      Success_pct = 100 * Success_rate,
+      Exp_success_pct = 100 * Exp_success_rate
+    )
+}
+
+make_primary_tables <- function(play_def_df) {
+  primary_candidates <- play_def_df %>%
+    group_by(game_id, play_id) %>%
+    filter(exp_prob == max(exp_prob, na.rm = TRUE)) %>%
+    ungroup()
+  
+  candidates_df <- primary_candidates %>%
+    group_by(game_id, play_id) %>%
+    mutate(n_tied = n()) %>%
+    ungroup()
+  
+  primary_play_df <- primary_candidates %>%
+    arrange(game_id, play_id, desc(exp_prob), nfl_id) %>%
+    group_by(game_id, play_id) %>%
+    slice_head(n=1) %>%
+    ungroup()
+  
+  list(primary_play_df = primary_play_df, candidates_df = candidates_df)
+}
+
+primary_uniqueness_checks <- function(primary_play_df, candidates_df) {
+  bad_primary <- primary_play_df %>% count(game_id, play_id) %>% filter(n != 1)
+  tie_summary <- candidates_df %>% filter(n_tied > 1) %>% count(n_tied, name="n_plays")
+  list(bad_primary_rows = bad_primary, tie_summary = tie_summary)
+}
+
+make_board <- function(df, pos, which = c("top","bottom"),
+                       n = 20,
+                       metric = c("POE_pp_shr","POE_pp","z"),
+                       min_opp = 25) {
+  which <- match.arg(which)
+  metric <- match.arg(metric)
+  out <- df %>% filter(pos_group == pos, Opportunities >= min_opp)
+  if (!nrow(out)) return(out)
+  out <- if (which == "top") {
+    out %>% arrange(desc(.data[[metric]]), desc(Opportunities), nfl_id)
+  } else {
+    out %>% arrange(.data[[metric]], desc(Opportunities), nfl_id)
+  }
+  out %>% slice_head(n = n)
+}
+
+print_board <- function(df, pos, which = c("top","bottom"),
+                        n = 20,
+                        metric = "POE_pp_shr",
+                        min_opp = 25) {
+  which <- match.arg(which)
+  out <- make_board(df, pos, which, n, metric, min_opp) %>%
+    transmute(
+      player = coalesce(def_name, as.character(nfl_id)),
+      nfl_id = nfl_id,
+      pos    = def_player_position,
+      Opportunities = Opportunities,
+      Successes = Successes,
+      Success_pct     = round(Success_pct, 1),
+      Exp_success_pct = round(Exp_success_pct, 1),
+      POE_pp          = round(POE_pp, 2),
+      POE_pp_shr      = round(POE_pp_shr, 2),
+      z               = round(z, 3)
+    )
+  print(out, n = n, width = Inf)
+  invisible(out)
+}
+
+check_carlton_opp <- function(def_summary_play_poscal, expected = 115) {
+  hit <- def_summary_play_poscal %>% filter(def_name == "Carlton Davis III")
+  if (nrow(hit) == 0) hit <- def_summary_play_poscal %>% filter(grepl("^Carlton Davis", def_name))
+  if (nrow(hit) == 0) {
+    warning("Could not find Carlton Davis in def_summary_play_poscal (name mismatch).")
+    return(invisible(NULL))
+  }
+  opp <- hit %>% arrange(desc(Opportunities)) %>% slice_head(n = 1) %>% pull(Opportunities)
+  cat("\n=== CHECK: Carlton Davis opportunities ===\n")
+  cat("Opportunities =", opp, " (expected ", expected, ")\n", sep = "")
+  if (!identical(as.integer(opp), as.integer(expected))) {
+    stop("Carlton Davis Opportunities mismatch. Got ", opp, ", expected ", expected,
+         ". This usually means split map / filtering / aggregation changed.")
+  }
+  invisible(TRUE)
+}
+
+smoke_test_frame_with_pos_def <- function(frame_with_pos_def) {
+  needed <- c(
+    "game_id","play_id","nfl_id","frame_id","frame_rel_throw",
+    "prob_reach_frame_xgb","def_player_position","def_name","label","split"
+  )
+  require_cols(frame_with_pos_def, needed, "frame_with_pos_def")
+  
+  cat("\n--- SMOKE: BASIC SHAPE ---\n")
+  print(frame_with_pos_def %>% summarise(
+    n_rows = n(),
+    n_plays = n_distinct(game_id, play_id),
+    n_def = n_distinct(nfl_id),
+    base_y = mean(label),
+    base_p = mean(prob_reach_frame_xgb)
+  ))
+  
+  cat("\n--- SMOKE: PROB RANGE / NA ---\n")
+  cat("NA prob:", sum(is.na(frame_with_pos_def$prob_reach_frame_xgb)), "\n")
+  cat("NA label:", sum(is.na(frame_with_pos_def$label)), "\n")
+  cat("prob <0:", sum(frame_with_pos_def$prob_reach_frame_xgb < 0), "\n")
+  cat("prob >1:", sum(frame_with_pos_def$prob_reach_frame_xgb > 1), "\n")
+  
+  cat("\n--- SMOKE: DUPES (game/play/nfl/frame) should be 0 ---\n")
+  print(frame_with_pos_def %>% count(game_id, play_id, nfl_id, frame_id) %>% filter(n > 1), n = 20)
+  
+  cat("\n--- SMOKE: SPLIT UNIQUE PER PLAY should be 0 ---\n")
+  print(frame_with_pos_def %>% distinct(game_id, play_id, split) %>% count(game_id, play_id) %>% filter(n > 1), n = 20)
+  
+  cat("\n--- SMOKE: WINDOW CHECK (min/max frame_rel_throw) ---\n")
+  print(frame_with_pos_def %>% summarise(min_fr = min(frame_rel_throw), max_fr = max(frame_rel_throw)))
+  
+  invisible(TRUE)
+}
+
+get_or_make_split_map <- function(plays_df, seed = 2025, prop_train = 0.8, split_rds = "data/split_map_seed2025_prop80.rds") {
+  maybe_dir(dirname(split_rds))
+  if (file.exists(split_rds)) return(readRDS(split_rds))
+  
+  plays_df <- plays_df %>% distinct(game_id, play_id) %>% arrange(game_id, play_id)
+  set.seed(seed)
+  sp <- rsample::initial_split(plays_df, prop = prop_train)
+  train_plays <- rsample::training(sp) %>% mutate(split = "train")
+  test_plays  <- rsample::testing(sp)  %>% mutate(split = "test")
+  split_map <- bind_rows(train_plays, test_plays)
+  
+  saveRDS(split_map, split_rds)
+  split_map
+}
+
+project_dir <- "."
+train_dir <- "train"
+year <- 2023
+weeks <- 1:18
+within_yards <- 2
+frame_window_min <- -6L
+frame_window_max <- 0L
+seed <- 2025
+
+maybe_dir("data")
+maybe_dir("models")
+
+core <- make_core_data_from_raw_v1(
+  project_dir = project_dir,
+  train_dir = train_dir,
+  year = year,
+  weeks = weeks,
+  within_yards = within_yards,
+  use_cache = TRUE,
+  cache_path = "data/core_objects_v1.rds"
+)
+
+cd_frame_feat_full <- build_cd_frame_feat_full_v1(core, feat_cache_path = "data/cd_frame_feat_full_v1.rds", overwrite = FALSE)
+
+if (!file.exists("models/cd_frame_probs_xgb_v1_m6_0.rds")) {
+  res_v1 <- train_frame_model_v1_m6_0(
+    cd_frame_feat_full,
+    frame_window_min = frame_window_min,
+    frame_window_max = frame_window_max,
+    seed = seed,
+    model_dir = "models"
+  )
+  cat("\n=== FRAME MODEL METRICS (trained now) ===\n")
+  print(res_v1$metrics, width = Inf)
+} else if (file.exists("models/metrics_xgb_v1_m6_0.rds")) {
+  cat("\n=== FRAME MODEL METRICS (loaded) ===\n")
+  print(readRDS("models/metrics_xgb_v1_m6_0.rds"), width = Inf)
+}
+
+if (!file.exists("models/pos_map_v1.rds")) {
+  pos_map <- infer_pos_map_v1(core)
+  saveRDS(pos_map, "models/pos_map_v1.rds")
+} else {
+  pos_map <- readRDS("models/pos_map_v1.rds")
+}
+
+probs <- readRDS("models/cd_frame_probs_xgb_v1_m6_0.rds")
+
+split_map <- get_or_make_split_map(
+  probs %>% distinct(game_id, play_id),
+  seed = seed,
+  prop_train = 0.8,
+  split_rds = "data/split_map_seed2025_prop80.rds"
+)
+
+frame_with_pos_def <- probs %>%
+  transmute(
+    game_id, play_id, nfl_id, frame_id, frame_rel_throw,
+    prob_reach_frame_xgb = clip01(prob_reach_frame_xgb),
+    label = as.integer(defender_within_2yds)
+  ) %>%
+  left_join(pos_map, by = "nfl_id") %>%
+  left_join(split_map, by = c("game_id","play_id")) %>%
+  mutate(
+    def_name = dplyr::coalesce(def_name, NA_character_),
+    def_player_position = dplyr::coalesce(def_player_position, NA_character_)
+  )
+
+saveRDS(frame_with_pos_def, "models/frame_with_pos_def.rds")
+
+smoke_test_frame_with_pos_def(frame_with_pos_def)
+
+df_frames_scored <- frame_with_pos_def %>%
+  mutate(
+    pos_group = if ("pos_group" %in% names(.)) pos_group else pos_group_from_position(def_player_position),
+    exp_prob = pmin(pmax(prob_reach_frame_xgb, eps_prob), 1 - eps_prob)
+  )
+
+play_raw <- play_p0_from_frames_keep_split(df_frames_scored)
+
+stopifnot(all(play_raw$exp_prob >= 0 & play_raw$exp_prob <= 1))
+stopifnot(!anyNA(play_raw$exp_prob))
+stopifnot(!anyNA(play_raw$label))
+
+cat("\n=== SPLIT SANITY: split unique per play? (should be 0 rows) ===\n")
+print(
+  df_frames_scored %>% distinct(game_id, play_id, split) %>% count(game_id, play_id) %>% filter(n > 1),
+  n = 20
+)
+
+cal_train <- play_raw %>% filter(split != "test")
+pos_cals <- fit_pos_group_calibrators(cal_train, groups = c("CB","S","LB"))
+
+cat("\n=== POS-GROUP CALIBRATORS (coeffs) ===\n")
+for (g in c("CB","S","LB")) {
+  cal <- pos_cals[[g]]
+  if (is.null(cal)) {
+    cat(g, ": <NULL> (fell back to exp_prob)\n")
+  } else {
+    co <- coef(cal)
+    cat(g, ": intercept=", round(co[1],4), " slope=", round(co[2],4), "\n")
+  }
+}
+
+play_all_scored <- play_raw %>% mutate(oe = label - exp_prob)
+
+play_all_poscal <- apply_pos_group_calibrators(play_all_scored, pos_cals) %>%
+  mutate(oe_poscal = label - exp_prob_poscal)
+
+play_oos <- play_all_poscal %>% filter(split == "test")
+
+cat("\n=== DUPES CHECK (play_oos game/play/nfl_id, should be 0 rows) ===\n")
+print(play_oos %>% count(game_id, play_id, nfl_id) %>% filter(n > 1), n = 20)
+
+cat("\n=== PLAY_OOS METRICS (ALL): BASE exp_prob ===\n")
+print(eval_play_simple(play_oos %>% transmute(label, exp_prob)), width = Inf)
+
+cat("\n=== PLAY_OOS METRICS BY POS_GROUP: BASE exp_prob ===\n")
+print(eval_play_by_group(play_oos %>% transmute(pos_group, label, exp_prob), "pos_group"), width = Inf)
+
+cat("\n=== PLAY_OOS METRICS (ALL): POS-CAL exp_prob_poscal ===\n")
+print(eval_play_simple(play_oos %>% transmute(label, exp_prob = exp_prob_poscal)), width = Inf)
+
+cat("\n=== PLAY_OOS METRICS BY POS_GROUP: POS-CAL exp_prob_poscal ===\n")
+print(eval_play_by_group(play_oos %>% transmute(pos_group, label, exp_prob = exp_prob_poscal), "pos_group"), width = Inf)
+
+cat("\n=== RELIABILITY (deciles, PLAY_OOS): BASE exp_prob ===\n")
+print(reliability_bins(play_oos$label, play_oos$exp_prob, 10), n = 20)
+
+cat("\n=== RELIABILITY (deciles, PLAY_OOS): POS-CAL exp_prob_poscal ===\n")
+print(reliability_bins(play_oos$label, play_oos$exp_prob_poscal, 10), n = 20)
+
+cat("\n=== LIFT (deciles, PLAY_OOS): BASE exp_prob ===\n")
+print(lift_table_fixed(play_oos$label, play_oos$exp_prob, 10), n = 20)
+
+cat("\n=== LIFT (deciles, PLAY_OOS): POS-CAL exp_prob_poscal ===\n")
+print(lift_table_fixed(play_oos$label, play_oos$exp_prob_poscal, 10), n = 20)
+
+cat("\n=== CALIBRATION SLOPE/INTERCEPT (PLAY_OOS): BASE exp_prob ===\n")
+print(cal_slope_intercept(play_oos %>% transmute(label, exp_prob)), width = Inf)
+
+cat("\n=== CALIBRATION SLOPE/INTERCEPT (PLAY_OOS): POS-CAL exp_prob_poscal ===\n")
+print(cal_slope_intercept(play_oos %>% transmute(label, exp_prob = exp_prob_poscal)), width = Inf)
+
+cat("\n=== CALIBRATION SLOPE/INTERCEPT BY POS_GROUP (PLAY_OOS): POS-CAL ===\n")
+print(
+  play_oos %>%
+    group_by(pos_group) %>%
+    summarise(
+      n = n(),
+      base_y = mean(label),
+      base_p = mean(exp_prob_poscal),
+      cal = list(glm(label ~ safe_qlogis(exp_prob_poscal),
+                     data = pick(label, exp_prob_poscal),
+                     family = binomial())),
+      cal_intercept = coef(cal[[1]])[1],
+      cal_slope = coef(cal[[1]])[2],
+      .groups = "drop"
+    ),
+  width = Inf
+)
+
+play_def_df_poscal <- play_all_poscal %>%
+  transmute(
+    game_id, play_id, nfl_id, def_name, def_player_position, pos_group,
+    exp_prob = exp_prob_poscal,
+    label
+  )
+
+def_summary_play_poscal <- summarize_def_play(play_def_df_poscal, shrink_n = 50)
+
+cat("\n=== BASIC DATA SANITY (ALL defenders, POS-CAL) ===\n")
+print(
+  play_def_df_poscal %>% summarise(
+    n_rows = n(),
+    n_plays = n_distinct(game_id, play_id),
+    mean_label = mean(label),
+    mean_prob  = mean(exp_prob)
+  )
+)
+
+cat("\n=== PLAYER COUNTS (ALL defenders, POS-CAL) ===\n")
+print(
+  def_summary_play_poscal %>% summarise(
+    n_players = n(),
+    min_opp = min(Opportunities),
+    max_opp = max(Opportunities)
+  )
+)
+
+prim_objs_poscal <- make_primary_tables(play_def_df_poscal)
+checks_poscal <- primary_uniqueness_checks(
+  primary_play_df = prim_objs_poscal$primary_play_df,
+  candidates_df   = prim_objs_poscal$candidates_df
+)
+
+cat("\n=== PRIMARY UNIQUENESS CHECK: bad_primary_rows (should be empty) ===\n")
+print(checks_poscal$bad_primary_rows, n = 50)
+
+cat("\n=== PRIMARY TIE SUMMARY (ties before tie-break) ===\n")
+print(checks_poscal$tie_summary, n = 50)
+
+cat("\n=== PRIMARY TIE RATE (percent of plays with any tie) ===\n")
+tie_rate <- prim_objs_poscal$candidates_df %>%
+  distinct(game_id, play_id, n_tied) %>%
+  summarise(
+    n_plays = n(),
+    n_tied_plays = sum(n_tied > 1),
+    tie_rate = mean(n_tied > 1)
+  )
+print(tie_rate)
+
+cat("\n=== DISTRIBUTION OF n_tied (how big ties get) ===\n")
+tie_dist <- prim_objs_poscal$candidates_df %>%
+  distinct(game_id, play_id, n_tied) %>%
+  count(n_tied, name = "n_plays") %>%
+  arrange(n_tied)
+print(tie_dist, n = 50)
+
+freeze_version <- "p0_playcal_split_poscal_v1"
+freeze_time <- format(Sys.time(), tz="America/Los_Angeles", usetz=TRUE)
+
+model_freeze_poscal <- list(
+  version = freeze_version,
+  frozen_at = freeze_time,
+  calibration = list(
+    type = "glm_pos_group_playcal_on_logit",
+    eps_prob = eps_prob,
+    pos_cals = pos_cals
+  ),
+  data = list(
+    play_all_poscal = play_all_poscal,
+    play_oos = play_oos,
+    play_def_df_poscal = play_def_df_poscal
+  ),
+  leaderboards = list(
+    def_summary_play_poscal = def_summary_play_poscal
+  ),
+  primary = list(
+    primary_play_df = prim_objs_poscal$primary_play_df,
+    candidates_df   = prim_objs_poscal$candidates_df,
+    checks          = checks_poscal
+  ),
+  sanity = list(
+    play_oos_rows = nrow(play_oos),
+    play_oos_plays = n_distinct(play_oos$game_id, play_oos$play_id),
+    play_oos_base_y = mean(play_oos$label),
+    play_oos_base_p_poscal = mean(play_oos$exp_prob_poscal)
+  )
+)
+
+saveRDS(model_freeze_poscal, file.path("models", paste0(freeze_version, ".rds")))
+
+cat("\nSaved POS-CAL freeze to:", file.path("models", paste0(freeze_version, ".rds")), "\n")
+cat("Frozen at:", freeze_time, "\n")
+
+cat("\n============================\n")
+cat("ALL-DEFENDER LEADERBOARDS (POS-CAL)\n")
+cat("============================\n")
+
+for (pos in c("CB","S","LB")) {
+  cat("\n---", pos, "TOP 20 (RAW: POE_pp, min_opp=75) ---\n")
+  print_board(def_summary_play_poscal, pos, "top", 20, metric = "POE_pp", min_opp = 75)
+  cat("\n---", pos, "BOTTOM 20 (RAW: POE_pp, min_opp=75) ---\n")
+  print_board(def_summary_play_poscal, pos, "bottom", 20, metric = "POE_pp", min_opp = 75)
+  
+  cat("\n---", pos, "TOP 20 (SHR: POE_pp_shr, min_opp=75) ---\n")
+  print_board(def_summary_play_poscal, pos, "top", 20, metric = "POE_pp_shr", min_opp = 75)
+  cat("\n---", pos, "BOTTOM 20 (SHR: POE_pp_shr, min_opp=75) ---\n")
+  print_board(def_summary_play_poscal, pos, "bottom", 20, metric = "POE_pp_shr", min_opp = 75)
+}
+
+check_carlton_opp(def_summary_play_poscal, expected = 115)
