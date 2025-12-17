@@ -3027,3 +3027,56 @@ ggsave(
 )
 ######## End: POBOE classification performance, don't delete ########
 
+######## Start: XG Boost Expected Prob of Defender in Position, don't delete ########
+# Choose fixed values for other features
+median_s <- median(cd_frame_feat_full$def_s, na.rm = TRUE)
+median_a <- median(cd_frame_feat_full$def_a, na.rm = TRUE)
+median_time_to_arrival <- median(cd_frame_feat_full$time_to_arrival, na.rm = TRUE)
+median_heading_error <- median(cd_frame_feat_full$heading_error, na.rm = TRUE)
+
+# Define grid
+grid_df <- expand.grid(
+  dist_to_ball = seq(0, 10, by = 0.5),
+  angle_to_ball = seq(-pi, pi, by = 0.1),
+  frame_rel_throw = 0,   # can fix at throw frame
+  def_s = median_s,
+  def_a = median_a,
+  time_to_arrival = median_time_to_arrival,
+  heading_error = median_heading_error
+)
+
+# Correct formula (no response)
+form <- ~ frame_rel_throw + dist_to_ball + def_s + def_a + time_to_arrival + angle_to_ball + heading_error
+
+# Build model matrix
+X_grid <- sparse.model.matrix(form, data = grid_df)[, -1]  # remove intercept if needed
+
+# Raw predictions
+p_raw <- predict(res_v1$model, X_grid)
+
+# Calibration
+cal_intercept <- res_v1$metrics$cal_intercept[[1]]
+cal_slope     <- res_v1$metrics$cal_slope[[1]]
+p_cal <- plogis(cal_intercept + cal_slope * qlogis(p_raw))
+
+grid_df$Expected_pct <- p_cal * 100
+
+expected_prob_func <- ggplot(grid_df, aes(x = dist_to_ball, y = angle_to_ball, fill = Expected_pct)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "yellow", high = "red", midpoint = 50, limits = c(0, 100)) +
+  labs(
+    title = "Expected Probability of Defender In Position",
+    x = "Distance to Ball (Yards)",
+    y = "Angle to Ball (Radians)",
+    fill = "Expected %"
+  ) +
+  theme_minimal(base_size = 14)
+
+ggsave(
+  filename = "expected_prob_func.png",
+  plot = expected_prob_func,
+  width = 6,
+  height = 3,
+  dpi = 300
+)
+######## End: XG Boost Expected Prob of Defender in Position, don't delete ########
