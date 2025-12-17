@@ -2647,9 +2647,9 @@ animate_xgb_prob <- function(game_id_sel, play_id_sel, fps = 12, out_path = NULL
     geom_point(size = 2.3, color = "red") +
     
     labs(
-      title = paste0("POBE Estimate Over Time\n", visitor, " vs ", home, " | Player: ", cd_name),
+      title = paste0("Play on Ball Estimate Over Time\n", visitor, " vs ", home, " | Player: ", cd_name),
       x = "Frame",
-      y = "Probability of Defender In-Phase"
+      y = "Probability of Defender In-Position"
     ) +
     
     scale_x_continuous(breaks = seq(0, max(df_plot$frame_rel), by = 5)) +
@@ -3070,7 +3070,10 @@ expected_prob_func <- ggplot(grid_df, aes(x = dist_to_ball, y = angle_to_ball, f
     y = "Angle to Ball (Radians)",
     fill = "Expected %"
   ) +
-  theme_minimal(base_size = 14)
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
 
 ggsave(
   filename = "expected_prob_func.png",
