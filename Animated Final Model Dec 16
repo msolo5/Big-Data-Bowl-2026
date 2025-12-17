@@ -1,0 +1,1403 @@
+req_pkgs <- c(
+  "dplyr","tibble","readr","rsample","Matrix","xgboost",
+  "pROC","tidyr","ggplot2","gganimate","gifski","scales","stringr"
+)
+to_install <- req_pkgs[!vapply(req_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(to_install) > 0) install.packages(to_install, repos = "https://cloud.r-project.org")
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(rsample)
+  library(Matrix)
+  library(xgboost)
+  library(pROC)
+  library(tidyr)
+  library(ggplot2)
+  library(gganimate)
+  library(gifski)
+  library(scales)
+  library(stringr)
+})
+
+eps_prob <- 1e-6
+clip01 <- function(x) pmin(pmax(as.numeric(x), eps_prob), 1 - eps_prob)
+safe_qlogis <- function(p) qlogis(pmin(pmax(p, eps_prob), 1 - eps_prob))
+safe_plogis <- function(x) plogis(pmin(pmax(x, -20), 20))
+
+maybe_dir <- function(path) {
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  invisible(TRUE)
+}
+
+require_cols <- function(df, cols, df_name = "df") {
+  miss <- setdiff(cols, names(df))
+  if (length(miss)) {
+    stop(
+      df_name, " missing required columns: ", paste(miss, collapse = ", "),
+      "\nAvailable columns: ", paste(names(df), collapse = ", ")
+    )
+  }
+  invisible(TRUE)
+}
+
+read_weeks <- function(train_dir, prefix, weeks = 1:18, year = 2023) {
+  paths <- file.path(train_dir, sprintf("%s_%d_w%02d.csv", prefix, year, weeks))
+  paths <- paths[file.exists(paths)]
+  if (!length(paths)) stop("No files found for prefix=", prefix, " in ", train_dir)
+  dplyr::bind_rows(lapply(paths, function(p) readr::read_csv(p, show_col_types = FALSE)))
+}
+
+add_missing_cols <- function(df, cols) {
+  for (cc in cols) if (!cc %in% names(df)) df[[cc]] <- NA
+  df
+}
+
+find_supp_path <- function(project_dir = ".", also_search_downloads = TRUE) {
+  project_dir <- normalizePath(project_dir, winslash = "/", mustWork = FALSE)
+  hits_proj <- list.files(project_dir, pattern = "^supplementary_data\\.csv$", full.names = TRUE)
+  hits_data <- list.files(file.path(project_dir, "data"), pattern = "^supplementary_data\\.csv$", full.names = TRUE)
+  hits <- c(hits_proj, hits_data)
+  
+  if (also_search_downloads) {
+    dl <- path.expand("~/Downloads")
+    if (dir.exists(dl)) {
+      hits_dl <- list.files(dl, pattern = "^supplementary_data\\.csv$", full.names = TRUE, recursive = TRUE)
+      hits <- c(hits, hits_dl)
+    }
+  }
+  
+  hits <- hits[file.exists(hits)]
+  if (!length(hits)) return(NA_character_)
+  hits[[1]]
+}
+
+pos_group_from_position <- function(pos) {
+  pos <- toupper(as.character(pos))
+  dplyr::case_when(
+    pos %in% c("CB") ~ "CB",
+    pos %in% c("S","FS","SS") ~ "S",
+    grepl("LB", pos) | pos %in% c("ILB","OLB","MLB") ~ "LB",
+    TRUE ~ "Other"
+  )
+}
+
+# ============================================================
+# 1) Build core objects from raw Kaggle weekly CSVs (self-contained)
+# ============================================================
+make_core_data_from_raw <- function(
+    project_dir = ".",
+    train_dir = "train",
+    year = 2023,
+    weeks = 1:18,
+    within_yards = 2,
+    use_cache = TRUE,
+    cache_path = "data/core_objects.rds"
+) {
+  old <- getwd()
+  on.exit(setwd(old), add = TRUE)
+  setwd(project_dir)
+  
+  maybe_dir(dirname(cache_path))
+  
+  if (use_cache && file.exists(cache_path)) {
+    core <- readRDS(cache_path)
+    return(core)
+  }
+  
+  inputs_all  <- read_weeks(train_dir, "input",  weeks, year)
+  outputs_all <- read_weeks(train_dir, "output", weeks, year)
+  
+  require_cols(inputs_all, c("game_id","play_id","frame_id","nfl_id","x","y","s","a","dir","o"), "inputs_all")
+  require_cols(outputs_all, c("game_id","play_id","nfl_id","frame_id","x","y"), "outputs_all")
+  
+  if (!"player_to_predict" %in% names(inputs_all)) inputs_all$player_to_predict <- NA
+  inputs_all <- inputs_all %>%
+    mutate(
+      player_to_predict = dplyr::case_when(
+        is.logical(player_to_predict) ~ player_to_predict,
+        is.numeric(player_to_predict) ~ player_to_predict == 1,
+        TRUE ~ as.character(player_to_predict) %in% c("TRUE","T","1","true","True")
+      )
+    )
+  
+  opt_cols <- c("player_name","player_position","player_side","player_role","ball_land_x","ball_land_y")
+  inputs_all2 <- add_missing_cols(inputs_all, opt_cols)
+  
+  if (all(c("ball_land_x","ball_land_y") %in% names(inputs_all2)) &&
+      any(!is.na(inputs_all2$ball_land_x)) && any(!is.na(inputs_all2$ball_land_y))) {
+    throw_land <- inputs_all2 %>%
+      transmute(game_id, play_id, land_x = ball_land_x, land_y = ball_land_y) %>%
+      filter(!is.na(land_x), !is.na(land_y)) %>%
+      distinct(game_id, play_id, .keep_all = TRUE)
+  } else {
+    supp_path <- find_supp_path(project_dir = project_dir, also_search_downloads = TRUE)
+    if (is.na(supp_path)) stop("Could not find supplementary_data.csv (and ball_land_x/ball_land_y not present in inputs).")
+    supp <- readr::read_csv(supp_path, show_col_types = FALSE)
+    require_cols(supp, c("game_id","play_id","ball_land_x","ball_land_y"), "supplementary_data")
+    throw_land <- supp %>%
+      transmute(game_id, play_id, land_x = ball_land_x, land_y = ball_land_y) %>%
+      filter(!is.na(land_x), !is.na(land_y)) %>%
+      distinct(game_id, play_id, .keep_all = TRUE)
+  }
+  
+  out_last <- outputs_all %>%
+    filter(!is.na(frame_id)) %>%
+    group_by(game_id, play_id, nfl_id) %>%
+    slice_max(frame_id, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    transmute(game_id, play_id, nfl_id, out_x = x, out_y = y)
+  
+  cd <- out_last %>%
+    left_join(throw_land, by = c("game_id","play_id")) %>%
+    mutate(
+      dist_final_to_land = sqrt((out_x - land_x)^2 + (out_y - land_y)^2),
+      label = as.integer(dist_final_to_land <= within_yards)
+    ) %>%
+    select(game_id, play_id, nfl_id, label)
+  
+  all_frames <- inputs_all2 %>%
+    transmute(
+      game_id, play_id, nfl_id, frame_id,
+      x, y, s, a, dir, o,
+      player_to_predict,
+      player_name, player_position, player_side, player_role
+    ) %>%
+    arrange(game_id, play_id, nfl_id, frame_id)
+  
+  cd_frames <- all_frames %>%
+    filter(player_to_predict %in% TRUE) %>%
+    group_by(game_id, play_id, nfl_id) %>%
+    mutate(throw_frame = max(frame_id, na.rm = TRUE),
+           frame_rel_throw = as.integer(frame_id - throw_frame)) %>%
+    ungroup() %>%
+    left_join(cd, by = c("game_id","play_id","nfl_id")) %>%
+    transmute(
+      game_id, play_id, nfl_id, frame_id,
+      frame_rel_throw,
+      def_s = s, def_a = a,
+      label
+    )
+  
+  core <- list(
+    cd = cd,
+    cd_frames = cd_frames,
+    all_frames = all_frames,
+    throw_land = throw_land
+  )
+  
+  saveRDS(core, cache_path)
+  core
+}
+
+# ============================================================
+# 2) Frame features + XGB model + calibration (self-contained)
+# ============================================================
+build_cd_frame_feat_full <- function(
+    core,
+    feat_cache_path = "data/cd_frame_feat_full.rds",
+    overwrite = FALSE
+) {
+  maybe_dir(dirname(feat_cache_path))
+  if (file.exists(feat_cache_path) && !overwrite) return(readRDS(feat_cache_path))
+  
+  cd_frames <- core$cd_frames
+  all_frames <- core$all_frames
+  throw_land <- core$throw_land
+  
+  xyo <- all_frames %>%
+    select(game_id, play_id, nfl_id, frame_id, x, y, dir, o) %>%
+    distinct(game_id, play_id, nfl_id, frame_id, .keep_all = TRUE)
+  
+  cd_frame_feat_full <- cd_frames %>%
+    left_join(throw_land, by = c("game_id","play_id")) %>%
+    left_join(xyo, by = c("game_id","play_id","nfl_id","frame_id")) %>%
+    mutate(
+      time_to_arrival = -frame_rel_throw / 10,
+      dx = land_x - x,
+      dy = land_y - y,
+      dist_to_ball = sqrt(dx^2 + dy^2),
+      angle_to_ball = atan2(dy, dx),
+      orient_rad = o * pi / 180,
+      heading_error = atan2(sin(angle_to_ball - orient_rad), cos(angle_to_ball - orient_rad))
+    ) %>%
+    select(
+      game_id, play_id, nfl_id, frame_id,
+      label, frame_rel_throw,
+      dist_to_ball, def_s, def_a,
+      time_to_arrival, angle_to_ball, heading_error
+    ) %>%
+    filter(stats::complete.cases(.))
+  
+  saveRDS(cd_frame_feat_full, feat_cache_path)
+  cd_frame_feat_full
+}
+
+train_frame_xgb <- function(
+    cd_frame_feat_full,
+    frame_window_min = -6L,
+    frame_window_max = 0L,
+    seed = 2025,
+    model_dir = "models",
+    use_cache = TRUE
+) {
+  maybe_dir(model_dir)
+  
+  probs_path   <- file.path(model_dir, "cd_frame_probs_xgb.rds")
+  metrics_path <- file.path(model_dir, "metrics_xgb.rds")
+  model_path   <- file.path(model_dir, "xgb_frame.rds")
+  cal_path     <- file.path(model_dir, "xgb_frame_calibration.rds")
+  
+  if (use_cache && file.exists(probs_path) && file.exists(metrics_path) && file.exists(cal_path)) {
+    out <- list(
+      model = if (file.exists(model_path)) readRDS(model_path) else NULL,
+      metrics = readRDS(metrics_path),
+      probs = readRDS(probs_path),
+      calibration = readRDS(cal_path)
+    )
+    return(out)
+  }
+  
+  cd_frame_feat <- cd_frame_feat_full %>%
+    filter(frame_rel_throw >= frame_window_min, frame_rel_throw <= frame_window_max) %>%
+    arrange(game_id, play_id, nfl_id, frame_id)
+  
+  set.seed(seed)
+  unique_plays <- cd_frame_feat %>% distinct(game_id, play_id)
+  outer <- rsample::initial_split(unique_plays, prop = 0.8)
+  train_plays <- rsample::training(outer)
+  test_plays  <- rsample::testing(outer)
+  
+  inner <- rsample::initial_split(train_plays, prop = 0.8)
+  fit_plays <- rsample::training(inner)
+  val_plays <- rsample::testing(inner)
+  
+  df_fit  <- cd_frame_feat %>% inner_join(fit_plays, by = c("game_id","play_id"))
+  df_val  <- cd_frame_feat %>% inner_join(val_plays, by = c("game_id","play_id"))
+  df_test <- cd_frame_feat %>% inner_join(test_plays, by = c("game_id","play_id"))
+  
+  form <- label ~ frame_rel_throw + dist_to_ball + def_s + def_a + time_to_arrival + angle_to_ball + heading_error
+  
+  X_fit  <- Matrix::sparse.model.matrix(form, data = df_fit)[, -1]
+  X_val  <- Matrix::sparse.model.matrix(form, data = df_val)[, -1]
+  X_test <- Matrix::sparse.model.matrix(form, data = df_test)[, -1]
+  
+  dfit <- xgboost::xgb.DMatrix(X_fit,  label = df_fit$label)
+  dval <- xgboost::xgb.DMatrix(X_val,  label = df_val$label)
+  dtes <- xgboost::xgb.DMatrix(X_test, label = df_test$label)
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    max_depth = 4,
+    eta = 0.05,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    min_child_weight = 10,
+    lambda = 1
+  )
+  
+  xgb_frame <- xgboost::xgb.train(
+    params = params,
+    data = dfit,
+    nrounds = 2000,
+    watchlist = list(train = dfit, eval = dval),
+    early_stopping_rounds = 50,
+    verbose = 1
+  )
+  
+  best_iter <- xgb_frame$best_iteration
+  
+  p_test_raw <- clip01(predict(xgb_frame, dtes))
+  y_test <- as.integer(df_test$label)
+  
+  logloss_raw <- -mean(y_test * log(p_test_raw) + (1 - y_test) * log(1 - p_test_raw))
+  brier_raw <- mean((p_test_raw - y_test)^2)
+  
+  p_val_raw <- clip01(predict(xgb_frame, dval))
+  logit_val <- safe_qlogis(p_val_raw)
+  
+  cal_model <- tryCatch(
+    stats::glm(as.integer(df_val$label) ~ logit_val, family = stats::binomial()),
+    error = function(e) NULL
+  )
+  
+  if (is.null(cal_model) || any(!is.finite(stats::coef(cal_model)))) {
+    cal_intercept <- safe_qlogis(mean(df_val$label))
+    cal_slope <- 1
+  } else {
+    cal_intercept <- unname(stats::coef(cal_model)[1])
+    cal_slope <- unname(stats::coef(cal_model)[2])
+  }
+  
+  p_test_cal <- clip01(safe_plogis(cal_intercept + cal_slope * safe_qlogis(p_test_raw)))
+  logloss_cal <- -mean(y_test * log(p_test_cal) + (1 - y_test) * log(1 - p_test_cal))
+  brier_cal <- mean((p_test_cal - y_test)^2)
+  
+  metrics <- tibble(
+    logloss_raw = logloss_raw,
+    brier_raw = brier_raw,
+    logloss = logloss_cal,
+    brier = brier_cal,
+    cal_slope = cal_slope,
+    cal_intercept = cal_intercept,
+    best_iter = best_iter,
+    n_test = length(y_test),
+    base_rate = mean(y_test)
+  )
+  
+  X_all <- Matrix::sparse.model.matrix(form, data = cd_frame_feat)[, -1]
+  dall <- xgboost::xgb.DMatrix(X_all)
+  p_all_raw <- clip01(predict(xgb_frame, dall))
+  p_all_cal <- clip01(safe_plogis(cal_intercept + cal_slope * safe_qlogis(p_all_raw)))
+  
+  cd_frame_probs <- cd_frame_feat %>%
+    mutate(prob_reach_frame_xgb = p_all_cal) %>%
+    select(game_id, play_id, nfl_id, frame_id, frame_rel_throw, label, prob_reach_frame_xgb)
+  
+  saveRDS(xgb_frame, model_path)
+  saveRDS(metrics, metrics_path)
+  saveRDS(cd_frame_probs, probs_path)
+  saveRDS(
+    list(
+      intercept = cal_intercept,
+      slope = cal_slope,
+      best_iter = best_iter,
+      window_min = frame_window_min,
+      window_max = frame_window_max
+    ),
+    cal_path
+  )
+  
+  list(model = xgb_frame, metrics = metrics, probs = cd_frame_probs,
+       calibration = readRDS(cal_path))
+}
+
+infer_pos_map <- function(core) {
+  all_frames <- core$all_frames
+  cd_frames <- core$cd_frames
+  
+  ids <- unique(cd_frames$nfl_id)
+  
+  all_frames %>%
+    filter(nfl_id %in% ids) %>%
+    arrange(game_id, play_id, frame_id) %>%
+    group_by(nfl_id) %>%
+    summarise(
+      def_name = dplyr::coalesce(dplyr::first(stats::na.omit(player_name)), NA_character_),
+      def_player_position = dplyr::coalesce(dplyr::first(stats::na.omit(player_position)), NA_character_),
+      .groups = "drop"
+    )
+}
+
+make_play_split <- function(cd_frame_probs, seed = 2025, prop_test = 0.2) {
+  set.seed(seed)
+  unique_plays <- cd_frame_probs %>% distinct(game_id, play_id)
+  sp <- rsample::initial_split(unique_plays, prop = 1 - prop_test)
+  train_plays <- rsample::training(sp) %>% mutate(split = "train")
+  test_plays  <- rsample::testing(sp)  %>% mutate(split = "test")
+  bind_rows(train_plays, test_plays)
+}
+
+build_frame_with_pos_def <- function(
+    core,
+    cd_frame_probs,
+    pos_map,
+    play_split_tbl,
+    out_path = "models/frame_with_pos_def.rds"
+) {
+  maybe_dir(dirname(out_path))
+  
+  frame_with_pos_def <- cd_frame_probs %>%
+    left_join(pos_map, by = c("nfl_id")) %>%
+    left_join(play_split_tbl, by = c("game_id","play_id")) %>%
+    mutate(
+      def_name = coalesce(def_name, as.character(nfl_id)),
+      def_player_position = coalesce(def_player_position, NA_character_)
+    )
+  
+  saveRDS(frame_with_pos_def, out_path)
+  frame_with_pos_def
+}
+
+# ============================================================
+# 3) Good model (pos-group play calibration + leaderboards + freeze)
+# ============================================================
+eval_play_simple <- function(df) {
+  y <- df$label
+  p <- clip01(df$exp_prob)
+  brier   <- mean((y - p)^2)
+  logloss <- -mean(y*log(p) + (1-y)*log(1-p))
+  aucv    <- as.numeric(pROC::auc(y, p))
+  tibble(n=nrow(df), base_y=mean(y), base_p=mean(p), brier=brier, logloss=logloss, auc=aucv)
+}
+
+eval_play_by_group <- function(df, group_col = "pos_group") {
+  df %>%
+    group_by(.data[[group_col]]) %>%
+    group_modify(~eval_play_simple(.x)) %>%
+    ungroup() %>%
+    rename(!!group_col := .data[[group_col]])
+}
+
+reliability_bins <- function(y, p, bins = 10) {
+  tibble(y=y, p=p) %>%
+    mutate(p = clip01(p)) %>%
+    mutate(bin = ntile(p, bins)) %>%
+    group_by(bin) %>%
+    summarise(n=n(), mean_p=mean(p), mean_y=mean(y), .groups="drop") %>%
+    arrange(bin)
+}
+
+lift_table_fixed <- function(y, p, bins = 10) {
+  base <- mean(y)
+  tibble(y=y, p=p) %>%
+    mutate(p = clip01(p)) %>%
+    mutate(bin = ntile(desc(p), bins)) %>%
+    group_by(bin) %>%
+    summarise(
+      n = n(),
+      mean_p = mean(p),
+      mean_y = mean(y),
+      lift = mean_y / base,
+      .groups = "drop"
+    ) %>%
+    arrange(bin)
+}
+
+cal_slope_intercept <- function(df) {
+  fit <- glm(label ~ safe_qlogis(exp_prob), data = df, family = binomial())
+  tibble(cal_intercept = coef(fit)[1], cal_slope = coef(fit)[2])
+}
+
+play_p0_from_frames_keep_split <- function(frame_df) {
+  if (!("frame_rel_throw" %in% names(frame_df))) stop("frame_rel_throw column missing.")
+  frame_df %>%
+    filter(frame_rel_throw == 0L) %>%
+    group_by(game_id, play_id, nfl_id, def_name, def_player_position, pos_group) %>%
+    summarise(
+      exp_prob = mean(exp_prob, na.rm = TRUE),
+      label    = max(label, na.rm = TRUE),
+      split    = dplyr::first(split),
+      .groups  = "drop"
+    )
+}
+
+fit_pos_group_calibrators <- function(play_train, groups = c("CB","S","LB")) {
+  out <- vector("list", length(groups))
+  names(out) <- groups
+  for (g in groups) {
+    df_g <- play_train %>% filter(pos_group == g)
+    if (nrow(df_g) < 200 || length(unique(df_g$label)) < 2) {
+      out[[g]] <- NULL
+    } else {
+      out[[g]] <- glm(label ~ safe_qlogis(exp_prob), data = df_g, family = binomial())
+    }
+  }
+  out
+}
+
+apply_pos_group_calibrators <- function(play_df, pos_cals, out_col = "exp_prob_poscal") {
+  play_df %>%
+    mutate(
+      "{out_col}" := {
+        p <- clip01(exp_prob)
+        g <- pos_group
+        vapply(seq_along(p), function(i) {
+          cal <- pos_cals[[g[[i]]]]
+          if (is.null(cal)) return(p[[i]])
+          safe_plogis(coef(cal)[1] + coef(cal)[2] * safe_qlogis(p[[i]]))
+        }, numeric(1))
+      }
+    )
+}
+
+summarize_def_play <- function(play_def_df, shrink_n = 50) {
+  play_def_df %>%
+    group_by(nfl_id, def_name, def_player_position, pos_group) %>%
+    summarise(
+      Opportunities = n(),
+      Successes = sum(label),
+      Exp_success_rate = mean(exp_prob),
+      Success_rate = mean(label),
+      num = sum(label - exp_prob),
+      den = sqrt(sum(exp_prob*(1-exp_prob))),
+      z = num / pmax(den, 1e-12),
+      .groups="drop"
+    ) %>%
+    mutate(
+      POE = Success_rate - Exp_success_rate,
+      shrink_w = Opportunities / (Opportunities + shrink_n),
+      POE_shr = shrink_w * POE,
+      success_rate_shr = Exp_success_rate + POE_shr,
+      POE_pp = 100 * POE,
+      POE_pp_shr = 100 * POE_shr,
+      Success_pct = 100 * Success_rate,
+      Exp_success_pct = 100 * Exp_success_rate
+    )
+}
+
+make_primary_tables <- function(play_def_df) {
+  primary_candidates <- play_def_df %>%
+    group_by(game_id, play_id) %>%
+    filter(exp_prob == max(exp_prob, na.rm = TRUE)) %>%
+    ungroup()
+  
+  candidates_df <- primary_candidates %>%
+    group_by(game_id, play_id) %>%
+    mutate(n_tied = n()) %>%
+    ungroup()
+  
+  primary_play_df <- primary_candidates %>%
+    arrange(game_id, play_id, desc(exp_prob), nfl_id) %>%
+    group_by(game_id, play_id) %>%
+    slice_head(n=1) %>%
+    ungroup()
+  
+  list(primary_play_df = primary_play_df, candidates_df = candidates_df)
+}
+
+primary_uniqueness_checks <- function(primary_play_df, candidates_df) {
+  bad_primary <- primary_play_df %>% count(game_id, play_id) %>% filter(n != 1)
+  tie_summary <- candidates_df %>% filter(n_tied > 1) %>% count(n_tied, name="n_plays")
+  list(bad_primary_rows = bad_primary, tie_summary = tie_summary)
+}
+
+make_board <- function(df, pos, which = c("top","bottom"),
+                       n = 20,
+                       metric = c("POE_pp_shr","POE_pp","z"),
+                       min_opp = 25) {
+  which <- match.arg(which)
+  metric <- match.arg(metric)
+  out <- df %>% filter(pos_group == pos, Opportunities >= min_opp)
+  if (!nrow(out)) return(out)
+  out <- if (which == "top") {
+    out %>% arrange(desc(.data[[metric]]), desc(Opportunities), nfl_id)
+  } else {
+    out %>% arrange(.data[[metric]], desc(Opportunities), nfl_id)
+  }
+  out %>% slice_head(n = n)
+}
+
+print_board <- function(df, pos, which = c("top","bottom"),
+                        n = 20,
+                        metric = "POE_pp_shr",
+                        min_opp = 25) {
+  which <- match.arg(which)
+  out <- make_board(df, pos, which, n, metric, min_opp) %>%
+    transmute(
+      player = coalesce(def_name, as.character(nfl_id)),
+      nfl_id = nfl_id,
+      pos    = def_player_position,
+      Opportunities = Opportunities,
+      Successes = Successes,
+      Success_pct     = round(Success_pct, 1),
+      Exp_success_pct = round(Exp_success_pct, 1),
+      POE_pp          = round(POE_pp, 2),
+      POE_pp_shr      = round(POE_pp_shr, 2),
+      z               = round(z, 3)
+    )
+  print(out, n = n, width = Inf)
+  invisible(out)
+}
+
+eval_raw_vs_shr <- function(play_def_df, shrink_n = 50) {
+  by_player <- play_def_df %>%
+    group_by(nfl_id) %>%
+    summarise(
+      opp = n(),
+      raw = mean(label - exp_prob),
+      .groups = "drop"
+    )
+  
+  w <- by_player$opp / (by_player$opp + shrink_n)
+  shr <- w * by_player$raw
+  
+  tibble(
+    shrink_n = shrink_n,
+    n_players = nrow(by_player),
+    mse_raw = mean((by_player$raw)^2),
+    mse_shr = mean((shr)^2),
+    cor_raw = suppressWarnings(cor(by_player$raw, by_player$opp)),
+    cor_shr = suppressWarnings(cor(shr, by_player$opp))
+  )
+}
+
+tune_shrink_n <- function(play_def_df, grid = c(0,10,25,50,75,100,150,200)) {
+  bind_rows(lapply(grid, function(k) eval_raw_vs_shr(play_def_df, shrink_n = k))) %>%
+    arrange(mse_shr)
+}
+
+smoke_test_frame_with_pos_def <- function(frame_with_pos_def) {
+  cat("\n--- SMOKE: BASIC SHAPE ---\n")
+  print(
+    frame_with_pos_def %>%
+      summarise(
+        n_rows = n(),
+        n_plays = n_distinct(game_id, play_id),
+        n_def = n_distinct(nfl_id),
+        base_y = mean(label),
+        base_p = mean(prob_reach_frame_xgb)
+      ),
+    width = Inf
+  )
+  
+  cat("\n--- SMOKE: PROB RANGE / NA ---\n")
+  cat("NA prob:", sum(is.na(frame_with_pos_def$prob_reach_frame_xgb)), "\n")
+  cat("NA label:", sum(is.na(frame_with_pos_def$label)), "\n")
+  cat("prob <0:", sum(frame_with_pos_def$prob_reach_frame_xgb < 0, na.rm = TRUE), "\n")
+  cat("prob >1:", sum(frame_with_pos_def$prob_reach_frame_xgb > 1, na.rm = TRUE), "\n")
+  
+  cat("\n--- SMOKE: DUPES (game/play/nfl/frame) should be 0 ---\n")
+  print(
+    frame_with_pos_def %>% count(game_id, play_id, nfl_id, frame_id) %>% filter(n > 1),
+    n = 20
+  )
+  
+  cat("\n--- SMOKE: SPLIT UNIQUE PER PLAY should be 0 ---\n")
+  print(
+    frame_with_pos_def %>% distinct(game_id, play_id, split) %>% count(game_id, play_id) %>% filter(n > 1),
+    n = 20
+  )
+  
+  cat("\n--- SMOKE: WINDOW CHECK (min/max frame_rel_throw) ---\n")
+  print(
+    frame_with_pos_def %>% summarise(min_fr = min(frame_rel_throw), max_fr = max(frame_rel_throw)),
+    width = Inf
+  )
+  
+  invisible(TRUE)
+}
+
+# ============================================================
+# 4) Animation helpers (Viewer-friendly)
+# ============================================================
+draw_field_simple <- function() {
+  ggplot() +
+    geom_rect(aes(xmin = 0, xmax = 120, ymin = 0, ymax = 53.3), fill = "#0b6623") +
+    geom_rect(aes(xmin = 0, xmax = 10, ymin = 0, ymax = 53.3), fill = "#0b3f2f", alpha = 0.55) +
+    geom_rect(aes(xmin = 110, xmax = 120, ymin = 0, ymax = 53.3), fill = "#0b3f2f", alpha = 0.55) +
+    geom_vline(xintercept = seq(10, 110, 10), linetype = "dashed", color = "white", alpha = 0.7) +
+    geom_segment(aes(x = 0, xend = 120, y = 0, yend = 0), color = "white") +
+    geom_segment(aes(x = 0, xend = 120, y = 53.3, yend = 53.3), color = "white") +
+    coord_fixed(xlim = c(0, 120), ylim = c(0, 53.3), expand = FALSE) +
+    theme_void()
+}
+
+make_ball_traj_from_window <- function(frames_window_df, land_x, land_y) {
+  qb <- frames_window_df %>%
+    filter(player_role == "Passer", player_side == "Offense") %>%
+    group_by(frame_id) %>%
+    slice_head(n = 1) %>%
+    ungroup() %>%
+    transmute(frame_id, ball_x = x, ball_y = y)
+  
+  if (!nrow(qb)) {
+    qb <- frames_window_df %>%
+      group_by(frame_id) %>%
+      summarise(ball_x = mean(x, na.rm = TRUE), ball_y = mean(y, na.rm = TRUE), .groups = "drop")
+  }
+  
+  qb %>%
+    mutate(land_x = land_x, land_y = land_y)
+}
+
+animate_play_poscal_viewer <- function(
+    game_id_sel, play_id_sel,
+    core, frame_with_pos_def,
+    frame_window_min = -6L, frame_window_max = 0L,
+    top_k = 1,
+    fps = 12,
+    out_gif = NULL
+) {
+  require_cols(core$all_frames, c("game_id","play_id","nfl_id","frame_id","x","y","player_side","player_role","player_name","player_position"), "core$all_frames")
+  require_cols(core$throw_land, c("game_id","play_id","land_x","land_y"), "core$throw_land")
+  require_cols(frame_with_pos_def, c("game_id","play_id","nfl_id","frame_id","frame_rel_throw","prob_reach_frame_xgb","label","def_name","def_player_position"), "frame_with_pos_def")
+  
+  frames_play <- core$all_frames %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel)
+  
+  if (!nrow(frames_play)) stop("No frames found for this (game_id, play_id) in core$all_frames.")
+  
+  throw_frame <- frames_play %>% summarise(tf = max(frame_id, na.rm = TRUE)) %>% pull(tf)
+  
+  frames_play <- frames_play %>%
+    mutate(frame_rel_throw = as.integer(frame_id - throw_frame)) %>%
+    filter(frame_rel_throw >= frame_window_min, frame_rel_throw <= frame_window_max) %>%
+    arrange(frame_id, nfl_id)
+  
+  land <- core$throw_land %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel)
+  
+  if (!nrow(land)) stop("No throw_land found for this (game_id, play_id).")
+  land_x <- land$land_x[[1]]
+  land_y <- land$land_y[[1]]
+  
+  side_map <- core$all_frames %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel) %>%
+    distinct(nfl_id, player_side, player_role)
+  
+  cand_def <- frame_with_pos_def %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel, frame_rel_throw == 0L) %>%
+    inner_join(side_map, by = "nfl_id") %>%
+    filter(player_side == "Defense") %>%
+    arrange(desc(prob_reach_frame_xgb), nfl_id)
+  
+  if (!nrow(cand_def)) stop("No DEFENSE candidates found in frame_with_pos_def at frame_rel_throw==0 for this play.")
+  
+  cd_id <- cand_def %>% slice_head(n = top_k) %>% slice_tail(n = 1) %>% pull(nfl_id)
+  
+  cd_name <- frame_with_pos_def %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel, nfl_id == cd_id) %>%
+    slice_head(n = 1) %>%
+    pull(def_name)
+  
+  if (!length(cd_name) || is.na(cd_name)) cd_name <- paste0("Defender ", cd_id)
+  
+  cd_series <- frame_with_pos_def %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel, nfl_id == cd_id,
+           frame_rel_throw >= frame_window_min, frame_rel_throw <= frame_window_max) %>%
+    transmute(frame_id, prob = prob_reach_frame_xgb) %>%
+    arrange(frame_id)
+  
+  plot_df <- frames_play %>%
+    mutate(
+      role_color = case_when(
+        player_role == "Passer" ~ "orange",
+        player_role == "Targeted Receiver" ~ "limegreen",
+        player_side == "Defense" ~ "deepskyblue3",
+        TRUE ~ "gray70"
+      ),
+      role_color = ifelse(nfl_id == cd_id, "purple", role_color),
+      shape_val  = ifelse(player_side == "Offense", 16, 17)
+    )
+  
+  targeted_receiver <- plot_df %>%
+    filter(player_role == "Targeted Receiver", player_side == "Offense") %>%
+    group_by(frame_id) %>%
+    slice_head(n = 1) %>%
+    ungroup()
+  
+  cd_labels <- plot_df %>%
+    filter(nfl_id == cd_id) %>%
+    group_by(frame_id) %>%
+    slice_head(n = 1) %>%
+    ungroup() %>%
+    mutate(label = cd_name)
+  
+  prob_label_data <- cd_series %>%
+    mutate(
+      x = 5, y = 53,
+      label = paste0("P(reach ≤ 2yds) = ", scales::percent(prob, accuracy = 0.1))
+    )
+  
+  ball_traj <- make_ball_traj_from_window(plot_df, land_x, land_y)
+  
+  plot_obj <- draw_field_simple() +
+    geom_point(
+      data = plot_df,
+      aes(x = x, y = y, color = role_color,
+          shape = factor(shape_val), group = nfl_id),
+      size = 4, alpha = 0.85
+    ) +
+    geom_point(
+      data = ball_traj,
+      aes(x = ball_x, y = ball_y, group = frame_id),
+      color = "brown", size = 3, shape = 16
+    ) +
+    geom_point(
+      data = tibble(x = land_x, y = land_y),
+      aes(x = x, y = y),
+      color = "white", size = 2.5
+    ) +
+    geom_label(
+      data = targeted_receiver,
+      aes(x = x, y = y + 3, label = player_name),
+      fill = "red", color = "white", fontface = "bold", size = 3
+    ) +
+    geom_label(
+      data = cd_labels,
+      aes(x = x, y = y + 3, label = label),
+      fill = "purple", color = "white", fontface = "bold", size = 3
+    ) +
+    geom_label(
+      data = prob_label_data,
+      aes(x = x, y = y, label = label),
+      inherit.aes = FALSE,
+      hjust = 0, vjust = 1,
+      size  = 3,
+      fill  = "black",
+      color = "white"
+    ) +
+    scale_color_identity() +
+    scale_shape_manual(values = c("16" = 16, "17" = 17), guide = "none") +
+    labs(
+      title = paste0(
+        "Game: ", game_id_sel,
+        " | Play: ", play_id_sel,
+        " | Frame: {current_frame}"
+      ),
+      subtitle = paste0("Highlighted defender: ", cd_name, " (", cd_id, ")")
+    ) +
+    transition_manual(frame_id) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 11)
+    )
+  
+  if (is.null(out_gif)) {
+    anim <- gganimate::animate(plot_obj, fps = fps, width = 1100, height = 600)
+    return(anim)
+  } else {
+    maybe_dir(dirname(out_gif))
+    anim <- gganimate::animate(
+      plot_obj, fps = fps, width = 1100, height = 600,
+      renderer = gganimate::gifski_renderer(out_gif)
+    )
+    return(anim)
+  }
+}
+
+# ============================================================
+# 5) RUN EVERYTHING FROM SCRATCH (or cache) + PRINT ALL TESTS
+# ============================================================
+project_dir <- "."
+train_dir <- "train"
+year <- 2023
+weeks <- 1:18
+within_yards <- 2
+
+frame_window_min <- -6L
+frame_window_max <- 0L
+seed <- 2025
+
+maybe_dir("data")
+maybe_dir("models")
+maybe_dir("viz")
+
+core <- make_core_data_from_raw(
+  project_dir = project_dir,
+  train_dir = train_dir,
+  year = year,
+  weeks = weeks,
+  within_yards = within_yards,
+  use_cache = TRUE,
+  cache_path = "data/core_objects.rds"
+)
+
+cd_frame_feat_full <- build_cd_frame_feat_full(
+  core,
+  feat_cache_path = "data/cd_frame_feat_full.rds",
+  overwrite = FALSE
+)
+
+res_xgb <- train_frame_xgb(
+  cd_frame_feat_full,
+  frame_window_min = frame_window_min,
+  frame_window_max = frame_window_max,
+  seed = seed,
+  model_dir = "models",
+  use_cache = TRUE
+)
+
+cat("\n=== XGB FRAME MODEL METRICS ===\n")
+print(res_xgb$metrics, width = Inf)
+
+pos_map <- infer_pos_map(core)
+saveRDS(pos_map, "models/pos_map.rds")
+
+play_split_tbl <- make_play_split(res_xgb$probs, seed = seed, prop_test = 0.2)
+
+frame_with_pos_def <- build_frame_with_pos_def(
+  core = core,
+  cd_frame_probs = res_xgb$probs,
+  pos_map = pos_map,
+  play_split_tbl = play_split_tbl,
+  out_path = "models/frame_with_pos_def.rds"
+)
+
+smoke_test_frame_with_pos_def(frame_with_pos_def)
+
+cat("\n=== QUICK PROB DISTRIBUTION CHECK ===\n")
+print(
+  frame_with_pos_def %>%
+    summarise(
+      sd_p = sd(prob_reach_frame_xgb),
+      p01 = quantile(prob_reach_frame_xgb, 0.01),
+      p50 = quantile(prob_reach_frame_xgb, 0.50),
+      p99 = quantile(prob_reach_frame_xgb, 0.99)
+    ),
+  width = Inf
+)
+
+needed_cols <- c(
+  "game_id","play_id","nfl_id","frame_id","frame_rel_throw",
+  "prob_reach_frame_xgb","def_player_position","def_name","label","split"
+)
+miss <- setdiff(needed_cols, names(frame_with_pos_def))
+if (length(miss) > 0) stop(paste("frame_with_pos_def missing columns:", paste(miss, collapse=", ")))
+
+df_frames_scored <- frame_with_pos_def %>%
+  mutate(
+    pos_group = if ("pos_group" %in% names(.)) pos_group else pos_group_from_position(def_player_position),
+    exp_prob = clip01(prob_reach_frame_xgb)
+  )
+
+play_raw <- play_p0_from_frames_keep_split(df_frames_scored)
+
+stopifnot(all(play_raw$exp_prob >= 0 & play_raw$exp_prob <= 1))
+stopifnot(!anyNA(play_raw$exp_prob))
+stopifnot(!anyNA(play_raw$label))
+
+cat("\n=== SPLIT SANITY: split unique per play? (should be 0 rows) ===\n")
+print(
+  df_frames_scored %>% distinct(game_id, play_id, split) %>% count(game_id, play_id) %>% filter(n > 1),
+  n = 20
+)
+
+cal_train <- play_raw %>% filter(split != "test")
+cal_test  <- play_raw %>% filter(split == "test")
+
+pos_cals <- fit_pos_group_calibrators(cal_train, groups = c("CB","S","LB"))
+
+cat("\n=== POS-GROUP CALIBRATORS (coeffs) ===\n")
+for (g in c("CB","S","LB")) {
+  cal <- pos_cals[[g]]
+  if (is.null(cal)) {
+    cat(g, ": <NULL> (fell back to exp_prob)\n")
+  } else {
+    co <- coef(cal)
+    cat(g, ": intercept=", round(co[1],4), " slope=", round(co[2],4), "\n")
+  }
+}
+
+play_all_scored <- play_raw %>% mutate(oe = label - exp_prob)
+
+play_all_poscal <- apply_pos_group_calibrators(play_all_scored, pos_cals) %>%
+  mutate(oe_poscal = label - exp_prob_poscal)
+
+play_oos <- play_all_poscal %>% filter(split == "test")
+
+cat("\n=== DUPES CHECK (play_oos game/play/nfl_id, should be 0 rows) ===\n")
+print(play_oos %>% count(game_id, play_id, nfl_id) %>% filter(n > 1), n = 20)
+
+cat("\n=== PLAY_OOS METRICS (ALL): BASE exp_prob ===\n")
+print(eval_play_simple(play_oos %>% transmute(label, exp_prob)), width = Inf)
+
+cat("\n=== PLAY_OOS METRICS BY POS_GROUP: BASE exp_prob ===\n")
+print(eval_play_by_group(play_oos %>% transmute(pos_group, label, exp_prob), "pos_group"), width = Inf)
+
+cat("\n=== PLAY_OOS METRICS (ALL): POS-CAL exp_prob_poscal ===\n")
+print(eval_play_simple(play_oos %>% transmute(label, exp_prob = exp_prob_poscal)), width = Inf)
+
+cat("\n=== PLAY_OOS METRICS BY POS_GROUP: POS-CAL exp_prob_poscal ===\n")
+print(eval_play_by_group(play_oos %>% transmute(pos_group, label, exp_prob = exp_prob_poscal), "pos_group"), width = Inf)
+
+cat("\n=== RELIABILITY (deciles, PLAY_OOS): BASE exp_prob ===\n")
+print(reliability_bins(play_oos$label, play_oos$exp_prob, 10), n = 20)
+
+cat("\n=== RELIABILITY (deciles, PLAY_OOS): POS-CAL exp_prob_poscal ===\n")
+print(reliability_bins(play_oos$label, play_oos$exp_prob_poscal, 10), n = 20)
+
+cat("\n=== LIFT (deciles, PLAY_OOS): BASE exp_prob ===\n")
+print(lift_table_fixed(play_oos$label, play_oos$exp_prob, 10), n = 20)
+
+cat("\n=== LIFT (deciles, PLAY_OOS): POS-CAL exp_prob_poscal ===\n")
+print(lift_table_fixed(play_oos$label, play_oos$exp_prob_poscal, 10), n = 20)
+
+cat("\n=== CALIBRATION SLOPE/INTERCEPT (PLAY_OOS): BASE exp_prob ===\n")
+print(cal_slope_intercept(play_oos %>% transmute(label, exp_prob)), width = Inf)
+
+cat("\n=== CALIBRATION SLOPE/INTERCEPT (PLAY_OOS): POS-CAL exp_prob_poscal ===\n")
+print(cal_slope_intercept(play_oos %>% transmute(label, exp_prob = exp_prob_poscal)), width = Inf)
+
+play_def_df_poscal <- play_all_poscal %>%
+  transmute(
+    game_id, play_id, nfl_id, def_name, def_player_position, pos_group,
+    exp_prob = exp_prob_poscal,
+    label
+  )
+
+cat("\n=== SHRINK TUNING (raw vs shrunk) ===\n")
+print(eval_raw_vs_shr(play_def_df_poscal, shrink_n = 50), width = Inf)
+print(tune_shrink_n(play_def_df_poscal, grid = c(0,10,25,50,75,100,150,200)), width = Inf)
+
+shrink_n_final <- 25
+
+def_summary_play_poscal <- summarize_def_play(play_def_df_poscal, shrink_n = shrink_n_final)
+
+cat("\n=== BASIC DATA SANITY (ALL defenders, POS-CAL) ===\n")
+print(
+  play_def_df_poscal %>% summarise(
+    n_rows = n(),
+    n_plays = n_distinct(game_id, play_id),
+    mean_label = mean(label),
+    mean_prob  = mean(exp_prob)
+  ),
+  width = Inf
+)
+
+cat("\n=== PLAYER COUNTS (ALL defenders, POS-CAL) ===\n")
+print(
+  def_summary_play_poscal %>% summarise(
+    n_players = n(),
+    min_opp = min(Opportunities),
+    max_opp = max(Opportunities)
+  ),
+  width = Inf
+)
+
+prim_objs_poscal <- make_primary_tables(play_def_df_poscal)
+checks_poscal <- primary_uniqueness_checks(
+  primary_play_df = prim_objs_poscal$primary_play_df,
+  candidates_df   = prim_objs_poscal$candidates_df
+)
+
+cat("\n=== PRIMARY UNIQUENESS CHECK: bad_primary_rows (should be empty) ===\n")
+print(checks_poscal$bad_primary_rows, n = 50)
+
+cat("\n=== PRIMARY TIE SUMMARY (ties before tie-break) ===\n")
+print(checks_poscal$tie_summary, n = 50)
+
+cat("\n=== PRIMARY TIE RATE (percent of plays with any tie) ===\n")
+tie_rate <- prim_objs_poscal$candidates_df %>%
+  distinct(game_id, play_id, n_tied) %>%
+  summarise(
+    n_plays = n(),
+    n_tied_plays = sum(n_tied > 1),
+    tie_rate = mean(n_tied > 1)
+  )
+print(tie_rate, width = Inf)
+
+cat("\n============================\n")
+cat("ALL-DEFENDER LEADERBOARDS (POS-CAL)\n")
+cat("============================\n")
+
+for (pos in c("CB","S","LB")) {
+  cat("\n---", pos, "TOP 20 (RAW: POE_pp, min_opp=75) ---\n")
+  print_board(def_summary_play_poscal, pos, "top", 20, metric = "POE_pp", min_opp = 75)
+  cat("\n---", pos, "BOTTOM 20 (RAW: POE_pp, min_opp=75) ---\n")
+  print_board(def_summary_play_poscal, pos, "bottom", 20, metric = "POE_pp", min_opp = 75)
+  
+  cat("\n---", pos, "TOP 20 (SHR: POE_pp_shr, min_opp=75, shrink_n=25) ---\n")
+  print_board(def_summary_play_poscal, pos, "top", 20, metric = "POE_pp_shr", min_opp = 75)
+  cat("\n---", pos, "BOTTOM 20 (SHR: POE_pp_shr, min_opp=75, shrink_n=25) ---\n")
+  print_board(def_summary_play_poscal, pos, "bottom", 20, metric = "POE_pp_shr", min_opp = 75)
+}
+
+cat("\n=== CHECK: Carlton Davis III row (should be Opportunities == 115) ===\n")
+print(
+  def_summary_play_poscal %>%
+    filter(def_name == "Carlton Davis III") %>%
+    select(def_name, nfl_id, def_player_position, pos_group, Opportunities, POE_pp, POE_pp_shr, z) %>%
+    arrange(desc(Opportunities)),
+  width = Inf
+)
+
+cat("\n=== EXPORT: SHRUNK(25) POE_pp_shr DATAFRAME FOR TEAMMATE (viz) ===\n")
+viz_df_shr25 <- def_summary_play_poscal %>%
+  mutate(shrink_n = shrink_n_final) %>%
+  select(
+    nfl_id, def_name, def_player_position, pos_group,
+    Opportunities, Successes,
+    Exp_success_rate, Success_rate,
+    POE, POE_shr,
+    POE_pp, POE_pp_shr,
+    z,
+    shrink_n
+  )
+
+saveRDS(viz_df_shr25, "viz/def_summary_poscal_shr25.rds")
+readr::write_csv(viz_df_shr25, "viz/def_summary_poscal_shr25.csv")
+
+cat("\nSaved:\n  viz/def_summary_poscal_shr25.rds\n  viz/def_summary_poscal_shr25.csv\n")
+
+# ============================================================
+# 6) SAFETY HISTOGRAM + PERCENT CHECKS (current run)
+# ============================================================
+side_map_all <- core$all_frames %>%
+  distinct(game_id, play_id, nfl_id, player_side)
+
+throw_rows <- frame_with_pos_def %>% filter(frame_rel_throw == 0L)
+
+throw_rows_def <- throw_rows %>%
+  inner_join(side_map_all, by = c("game_id","play_id","nfl_id")) %>%
+  filter(player_side == "Defense")
+
+safety_throw <- throw_rows_def %>%
+  filter(def_player_position %in% c("S","FS","SS"))
+
+safety_play_max_xgb <- safety_throw %>%
+  group_by(game_id, play_id, nfl_id, def_name, def_player_position) %>%
+  summarise(
+    max_prob = max(prob_reach_frame_xgb, na.rm = TRUE),
+    label    = max(label, na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+safety_hist_xgb <- safety_play_max_xgb %>%
+  mutate(max_bin = cut(max_prob, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE)) %>%
+  count(max_bin, name = "n") %>%
+  arrange(max_bin)
+
+cat("\n=== SAFETY HISTOGRAM (max_prob bins) ===\n")
+print(safety_hist_xgb, n = 50)
+
+safety_thresholds <- safety_play_max_xgb %>%
+  summarise(
+    n_plays = n(),
+    pct_ge_0_40 = mean(max_prob >= 0.40),
+    pct_ge_0_50 = mean(max_prob >= 0.50),
+    pct_ge_0_60 = mean(max_prob >= 0.60),
+    pct_ge_0_70 = mean(max_prob >= 0.70),
+    pct_ge_0_80 = mean(max_prob >= 0.80),
+    pct_ge_0_90 = mean(max_prob >= 0.90)
+  )
+
+cat("\n=== SAFETY THRESHOLDS (from max_prob) ===\n")
+print(safety_thresholds, width = Inf)
+
+safety_bin_cal <- safety_play_max_xgb %>%
+  mutate(max_bin = cut(max_prob, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE)) %>%
+  group_by(max_bin) %>%
+  summarise(
+    n = n(),
+    mean_p = mean(max_prob),
+    mean_y = mean(label),
+    .groups = "drop"
+  ) %>%
+  arrange(max_bin)
+
+cat("\n=== SAFETY BIN CAL (mean_p vs mean_y) ===\n")
+print(safety_bin_cal, n = 50)
+
+cat("\n=== SAFETY BASE RATE (defender-opportunity level) ===\n")
+print(mean(safety_play_max_xgb$label))
+
+safety_play_level <- safety_play_max_xgb %>%
+  group_by(game_id, play_id) %>%
+  summarise(any_safety_within2 = as.integer(any(label == 1)), .groups = "drop")
+
+cat("\n=== SAFETY PLAY-LEVEL BASE RATE (any safety within2 on play) ===\n")
+print(mean(safety_play_level$any_safety_within2))
+
+# ============================================================
+# 7) FREEZE + SAVE MODEL OBJECTS
+# ============================================================
+freeze_version <- "final_poscal_v1"
+freeze_time <- format(Sys.time(), tz="America/Los_Angeles", usetz=TRUE)
+
+model_freeze <- list(
+  version = freeze_version,
+  frozen_at = freeze_time,
+  xgb = list(
+    metrics = res_xgb$metrics,
+    calibration = res_xgb$calibration
+  ),
+  poscal = list(
+    eps_prob = eps_prob,
+    pos_cals = pos_cals
+  ),
+  data = list(
+    frame_with_pos_def = frame_with_pos_def,
+    play_raw = play_raw,
+    play_all_poscal = play_all_poscal,
+    play_oos = play_oos,
+    play_def_df_poscal = play_def_df_poscal
+  ),
+  leaderboards = list(
+    shrink_n = shrink_n_final,
+    def_summary_play_poscal = def_summary_play_poscal,
+    viz_df_shr25 = viz_df_shr25
+  ),
+  primary = list(
+    primary_play_df = prim_objs_poscal$primary_play_df,
+    candidates_df   = prim_objs_poscal$candidates_df,
+    checks          = checks_poscal
+  ),
+  sanity = list(
+    safety_hist_xgb = safety_hist_xgb,
+    safety_thresholds = safety_thresholds,
+    safety_bin_cal = safety_bin_cal,
+    safety_base_rate_def_opp = mean(safety_play_max_xgb$label),
+    safety_base_rate_play_level = mean(safety_play_level$any_safety_within2)
+  )
+)
+
+saveRDS(model_freeze, file.path("models", paste0(freeze_version, ".rds")))
+cat("\nSaved freeze:", file.path("models", paste0(freeze_version, ".rds")), "\n")
+cat("Frozen at:", freeze_time, "\n")
+
+# ============================================================
+# 8) RUN AN EXAMPLE ANIMATION (shows in Viewer)
+# ============================================================
+anim <- animate_play_poscal_viewer(
+  game_id_sel = 2023091010,
+  play_id_sel = 3198,
+  core = core,
+  frame_with_pos_def = frame_with_pos_def,
+  frame_window_min = frame_window_min,
+  frame_window_max = frame_window_max,
+  top_k = 1,
+  fps = 12,
+  out_gif = NULL
+)
+anim
+pick_random_high_safety_play <- function(frame_with_pos_def, core,
+                                         top_k = 1,
+                                         min_prob = 0.85,
+                                         prefer_positive = TRUE,
+                                         seed = NULL) {
+  side_map <- core$all_frames %>%
+    distinct(game_id, play_id, nfl_id, player_side)
+  
+  throw_defs <- frame_with_pos_def %>%
+    filter(frame_rel_throw == 0L) %>%
+    inner_join(side_map, by = c("game_id","play_id","nfl_id")) %>%
+    filter(player_side == "Defense") %>%
+    mutate(def_pos = toupper(coalesce(def_player_position, "")))
+  
+  topk_by_play <- throw_defs %>%
+    group_by(game_id, play_id) %>%
+    arrange(desc(prob_reach_frame_xgb), nfl_id, .by_group = TRUE) %>%
+    mutate(rank = row_number()) %>%
+    ungroup() %>%
+    filter(rank == top_k) %>%
+    filter(def_pos %in% c("S","FS","SS")) %>%
+    filter(prob_reach_frame_xgb >= min_prob)
+  
+  if (!nrow(topk_by_play)) {
+    stop("No safety plays found with prob >= ", min_prob, ". Try lowering min_prob (e.g., 0.75).")
+  }
+  
+  if (prefer_positive && any(topk_by_play$label == 1, na.rm = TRUE)) {
+    topk_by_play <- topk_by_play %>% filter(label == 1)
+  }
+  
+  exclude_tbl <- tibble(game_id = integer(), play_id = integer())
+  
+  if (exists("example_safety", inherits = TRUE)) {
+    ex <- get("example_safety", inherits = TRUE)
+    if (all(c("game_id","play_id") %in% names(ex)) && nrow(ex) >= 1) {
+      exclude_tbl <- bind_rows(
+        exclude_tbl,
+        tibble(game_id = ex$game_id[[1]], play_id = ex$play_id[[1]])
+      )
+    }
+  }
+  
+  exclude_tbl <- bind_rows(exclude_tbl, tibble(game_id = 2023091010L, play_id = 3198L)) %>%
+    distinct()
+  
+  cand <- topk_by_play %>%
+    anti_join(exclude_tbl, by = c("game_id","play_id"))
+  
+  if (!nrow(cand)) {
+    stop("After excluding the prior play(s), no candidates left. Lower min_prob or set prefer_positive=FALSE.")
+  }
+  
+  if (!is.null(seed)) set.seed(seed)
+  
+  cand %>%
+    sample_n(1) %>%
+    select(game_id, play_id, nfl_id, def_name, def_player_position, prob_reach_frame_xgb, label)
+}
+
+example_safety2 <- pick_random_high_safety_play(
+  frame_with_pos_def, core,
+  top_k = 1,
+  min_prob = 0.50,
+  prefer_positive = TRUE,
+  seed = NULL
+)
+print(example_safety2, width = Inf)
+
+anim <- animate_play_poscal_viewer(
+  game_id_sel = example_safety2$game_id[[1]],
+  play_id_sel = example_safety2$play_id[[1]],
+  core = core,
+  frame_with_pos_def = frame_with_pos_def,
+  frame_window_min = frame_window_min,
+  frame_window_max = frame_window_max,
+  top_k = 1,
+  fps = 12,
+  out_gif = NULL
+)
+anim
+animate_poscal_prob <- function(
+    game_id_sel, play_id_sel,
+    core, frame_with_pos_def,
+    frame_window_min = -6L, frame_window_max = 0L,
+    top_k = 1,
+    fps = 12,
+    out_path = NULL
+) {
+  require_cols(core$all_frames, c("game_id","play_id","nfl_id","player_side"), "core$all_frames")
+  require_cols(frame_with_pos_def, c("game_id","play_id","nfl_id","frame_id","frame_rel_throw","prob_reach_frame_xgb","def_name","def_player_position"), "frame_with_pos_def")
+  
+  side_map <- core$all_frames %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel) %>%
+    distinct(nfl_id, player_side)
+  
+  cand_def <- frame_with_pos_def %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel, frame_rel_throw == 0L) %>%
+    inner_join(side_map, by = "nfl_id") %>%
+    filter(player_side == "Defense") %>%
+    arrange(desc(prob_reach_frame_xgb), nfl_id)
+  
+  if (!nrow(cand_def)) stop("No DEFENSE candidates found at frame_rel_throw==0 for this play.")
+  
+  cd_id <- cand_def %>% slice_head(n = top_k) %>% slice_tail(n = 1) %>% pull(nfl_id)
+  
+  cd_name <- frame_with_pos_def %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel, nfl_id == cd_id) %>%
+    slice_head(n = 1) %>%
+    pull(def_name)
+  if (!length(cd_name) || is.na(cd_name)) cd_name <- paste0("Defender ", cd_id)
+  
+  cd_pos <- frame_with_pos_def %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel, nfl_id == cd_id) %>%
+    slice_head(n = 1) %>%
+    pull(def_player_position)
+  cd_pos <- ifelse(length(cd_pos) && !is.na(cd_pos), cd_pos, "NA")
+  
+  df_plot <- frame_with_pos_def %>%
+    filter(game_id == game_id_sel, play_id == play_id_sel, nfl_id == cd_id) %>%
+    filter(frame_rel_throw >= frame_window_min, frame_rel_throw <= frame_window_max) %>%
+    distinct(frame_rel_throw, .keep_all = TRUE) %>%
+    arrange(frame_rel_throw) %>%
+    tidyr::complete(frame_rel_throw = seq(frame_window_min, frame_window_max, by = 1)) %>%
+    tidyr::fill(prob_reach_frame_xgb, .direction = "down")
+  
+  p <- ggplot(df_plot, aes(x = frame_rel_throw, y = prob_reach_frame_xgb)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+    labs(
+      title = paste0("P(reach ≤ 2yds) over frames | Game ", game_id_sel, " Play ", play_id_sel),
+      subtitle = paste0("Highlighted: ", cd_name, " (", cd_pos, ", ", cd_id, ") | top_k=", top_k),
+      x = "frame_rel_throw (0 = throw frame)",
+      y = "Probability"
+    ) +
+    theme_minimal(base_size = 14) +
+    gganimate::transition_reveal(frame_rel_throw)
+  
+  if (is.null(out_path)) {
+    gganimate::animate(p, fps = fps, width = 900, height = 450, renderer = gifski_renderer())
+  } else {
+    maybe_dir(dirname(out_path))
+    gganimate::animate(p, fps = fps, width = 900, height = 450, renderer = gifski_renderer(out_path))
+  }
+}
+anim_line <- animate_poscal_prob(
+  game_id_sel = example_safety2$game_id[[1]],
+  play_id_sel = example_safety2$play_id[[1]],
+  core = core,
+  frame_with_pos_def = frame_with_pos_def,
+  frame_window_min = frame_window_min,
+  frame_window_max = frame_window_max,
+  top_k = 1,
+  fps = 12,
+  out_path = NULL
+)
+anim_line
