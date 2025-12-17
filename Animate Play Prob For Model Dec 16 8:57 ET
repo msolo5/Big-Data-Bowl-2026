@@ -1,0 +1,227 @@
+animate_play_pobe <- function(
+  game_id_sel, play_id_sel,
+  out_path = NULL, fps = 10,
+  pre_frames = 6L,
+  post_frames = 25
+) {
+  game_id_sel <- as.character(game_id_sel)
+  play_id_sel <- as.character(play_id_sel)
+
+  stopifnot(exists("core"), !is.null(core$all_frames), !is.null(core$throw_land))
+  stopifnot(exists("cd_frame_probs"))
+
+  all_frames <- core$all_frames
+  throw_land <- core$throw_land
+
+  play_all <- all_frames %>%
+    dplyr::filter(game_id == game_id_sel, play_id == play_id_sel) %>%
+    dplyr::arrange(frame_id, nfl_id)
+
+  if (!nrow(play_all)) stop("No frames found for this (game_id, play_id).")
+
+  throw_frame <- max(play_all$frame_id, na.rm = TRUE)
+  min_frame_input <- max(1L, as.integer(throw_frame - pre_frames))
+  max_frame_input <- as.integer(throw_frame)
+  max_frame <- as.integer(throw_frame + post_frames)
+
+  play_data <- play_all %>%
+    dplyr::filter(frame_id >= min_frame_input, frame_id <= max_frame_input)
+
+  if (!nrow(play_data)) stop("No frames in requested pre-throw window for this play.")
+
+  role_colors <- c(
+    "Passer"             = "orange",
+    "Targeted Receiver"  = "red",
+    "Other Route Runner" = "yellow",
+    "Defensive Coverage" = "blue",
+    "Football"           = "#815337"
+  )
+
+  play_data <- play_data %>%
+    dplyr::mutate(
+      nfl_id = as.character(nfl_id),
+      role_color = role_colors[player_role],
+      shape_val  = ifelse(player_side == "Offense", 16, 17)
+    )
+
+  all_frames_in_play <- play_data %>%
+    dplyr::group_by(nfl_id) %>%
+    tidyr::complete(frame_id = min_frame_input:max_frame) %>%
+    tidyr::fill(
+      x, y, role_color, shape_val, player_side, player_role, player_name, player_position, s, a,
+      .direction = "down"
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(nfl_id = as.character(nfl_id))
+
+  land_row <- throw_land %>%
+    dplyr::filter(game_id == game_id_sel, play_id == play_id_sel) %>%
+    dplyr::slice_head(n = 1)
+
+  land_x <- land_row$land_x[[1]]
+  land_y <- land_row$land_y[[1]]
+  if (is.na(land_x) || is.na(land_y)) stop("Missing land_x/land_y for this play (throw_land).")
+
+  qb_id <- play_data %>%
+    dplyr::filter(player_role == "Passer", player_side == "Offense") %>%
+    dplyr::slice_head(n = 1) %>%
+    dplyr::pull(nfl_id)
+
+  if (!length(qb_id) || is.na(qb_id)) {
+    qb_id <- play_data %>%
+      dplyr::filter(player_side == "Offense") %>%
+      dplyr::slice_head(n = 1) %>%
+      dplyr::pull(nfl_id)
+  }
+  qb_id <- as.character(qb_id)
+
+  qb_frames <- all_frames_in_play %>%
+    dplyr::filter(nfl_id == qb_id) %>%
+    dplyr::select(frame_id, qb_x = x, qb_y = y)
+
+  release_loc <- qb_frames %>% dplyr::filter(frame_id == throw_frame) %>% dplyr::slice_head(n = 1)
+  release_x <- release_loc$qb_x
+  release_y <- release_loc$qb_y
+
+  ball_pre <- qb_frames %>%
+    dplyr::filter(frame_id < throw_frame) %>%
+    dplyr::transmute(frame_id, ball_x = qb_x, ball_y = qb_y)
+
+  ball_post <- tibble::tibble(
+    frame_id = throw_frame:max_frame,
+    ball_x   = seq(release_x, land_x, length.out = (max_frame - throw_frame) + 1),
+    ball_y   = seq(release_y, land_y, length.out = (max_frame - throw_frame) + 1)
+  )
+
+  ball_trajectory <- dplyr::bind_rows(ball_pre, ball_post) %>%
+    dplyr::arrange(frame_id)
+
+  targeted_receiver <- all_frames_in_play %>% dplyr::filter(player_role == "Targeted Receiver")
+  if (!nrow(targeted_receiver)) {
+    cand_off <- all_frames_in_play %>%
+      dplyr::filter(frame_id == throw_frame, player_side == "Offense", nfl_id != qb_id) %>%
+      dplyr::mutate(d_land = sqrt((x - land_x)^2 + (y - land_y)^2)) %>%
+      dplyr::arrange(d_land) %>%
+      dplyr::slice_head(n = 1)
+
+    if (nrow(cand_off)) {
+      target_id <- as.character(cand_off$nfl_id[1])
+      targeted_receiver <- all_frames_in_play %>%
+        dplyr::filter(nfl_id == target_id) %>%
+        dplyr::mutate(player_role = "Targeted Receiver", role_color = "red")
+    }
+  }
+
+  primary_defender <- cd_frame_probs %>%
+    dplyr::filter(game_id == game_id_sel, play_id == play_id_sel, frame_id == throw_frame) %>%
+    dplyr::arrange(dplyr::desc(prob_reach_frame_xgb), nfl_id) %>%
+    dplyr::slice_head(n = 1)
+
+  if (!nrow(primary_defender)) stop("No defender probs found for this play at throw_frame.")
+  cd_id <- as.character(primary_defender$nfl_id[1])
+
+  cd_name <- {
+    nm <- all_frames_in_play %>%
+      dplyr::filter(nfl_id == cd_id) %>%
+      dplyr::summarise(nm = dplyr::first(stats::na.omit(player_name))) %>%
+      dplyr::pull(nm)
+    if (length(nm) && !is.na(nm)) nm else cd_id
+  }
+
+  all_frames_in_play <- all_frames_in_play %>%
+    dplyr::mutate(role_color = ifelse(nfl_id == cd_id, "purple", role_color))
+
+  cd_labels <- all_frames_in_play %>%
+    dplyr::filter(nfl_id == cd_id) %>%
+    dplyr::group_by(frame_id) %>% dplyr::slice_head(n = 1) %>% dplyr::ungroup() %>%
+    dplyr::mutate(label = cd_name)
+
+  cd_frame_prob <- cd_frame_probs %>%
+    dplyr::filter(game_id == game_id_sel, play_id == play_id_sel, nfl_id == cd_id) %>%
+    dplyr::arrange(frame_id) %>%
+    dplyr::select(frame_id, prob_reach_frame_xgb) %>%
+    dplyr::rename(prob_reach_frame = prob_reach_frame_xgb)
+
+  prob_label_data <- tibble::tibble(frame_id = min_frame_input:max_frame) %>%
+    dplyr::left_join(cd_frame_prob, by = "frame_id") %>%
+    dplyr::arrange(frame_id) %>%
+    tidyr::fill(prob_reach_frame, .direction = "down") %>%
+    dplyr::mutate(
+      x = 5, y = 53,
+      label = ifelse(
+        is.na(prob_reach_frame),
+        "P(reach \u2264 2 yds): NA",
+        paste0("P(reach \u2264 2 yds) = ", scales::percent(prob_reach_frame, accuracy = 0.1))
+      )
+    )
+
+  cd_prob_at_throw <- cd_frame_prob %>%
+    dplyr::filter(frame_id == throw_frame) %>%
+    dplyr::slice_head(n = 1) %>%
+    dplyr::pull(prob_reach_frame)
+
+  prob_text <- if (!is.na(cd_prob_at_throw)) {
+    paste0("XGBoost P(reach \u2264 2 yds at throw) = ", scales::percent(cd_prob_at_throw, accuracy = 0.1))
+  } else {
+    "XGBoost probability unavailable at throw"
+  }
+
+  play_desc <- paste0("game_id=", game_id_sel, " play_id=", play_id_sel)
+
+  p <- draw_field() +
+    ggplot2::geom_point(
+      data = all_frames_in_play,
+      ggplot2::aes(x = x, y = y, color = role_color, shape = factor(shape_val), group = nfl_id),
+      size = 4, alpha = 0.85
+    ) +
+    ggplot2::geom_point(
+      data = ball_trajectory,
+      ggplot2::aes(x = ball_x, y = ball_y, group = frame_id),
+      color = "#815337", size = 3, shape = 16
+    ) +
+    ggplot2::geom_label(
+      data = targeted_receiver %>% dplyr::group_by(frame_id) %>% dplyr::slice_head(n = 1) %>% dplyr::ungroup(),
+      ggplot2::aes(x = x, y = y + 3, label = player_name),
+      fill = "red", color = "white", fontface = "bold", size = 3
+    ) +
+    ggplot2::geom_label(
+      data = cd_labels,
+      ggplot2::aes(x = x, y = y + 3, label = label),
+      fill = "purple", color = "white", fontface = "bold", size = 3
+    ) +
+    ggplot2::geom_label(
+      data = prob_label_data,
+      ggplot2::aes(x = x, y = y, label = label),
+      inherit.aes = FALSE,
+      hjust = 0, vjust = 1,
+      size  = 3,
+      fill  = "black",
+      color = "white"
+    ) +
+    ggplot2::scale_color_identity() +
+    ggplot2::scale_shape_manual(values = c("16" = 16, "17" = 17), guide = "none") +
+    ggplot2::labs(
+      title = paste0(play_desc, " | Frame: {current_frame}"),
+      subtitle = prob_text
+    ) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(hjust = 0.5, vjust = -0.8, size = 13, face = "bold", lineheight = 1.1),
+      plot.subtitle = ggplot2::element_text(hjust = 0.5, size = 9)
+    ) +
+    gganimate::transition_manual(frame_id)
+
+  anim <- gganimate::animate(
+    p, fps = fps, width = 1700, height = 900, res = 200,
+    renderer = gganimate::gifski_renderer(loop = TRUE)
+  )
+
+  if (!is.null(out_path)) {
+    if (!grepl("\\.gif$", out_path, ignore.case = TRUE)) out_path <- paste0(out_path, ".gif")
+    gganimate::anim_save(filename = out_path, animation = anim)
+    if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+      rstudioapi::viewer(normalizePath(out_path, winslash = "/", mustWork = FALSE))
+    }
+  }
+
+  return(anim)
+}
