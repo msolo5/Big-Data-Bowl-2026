@@ -20,63 +20,70 @@ interp_xy <- function(df, nfl_id_move, x0, y0, x1, y1, throw_frame, max_frame) {
 }
 
 animate_play_pobe <- function(
-    game_id_sel, play_id_sel,
-    out_path = NULL,
-    fps = 12,
-    pre_frames = 6L,
-    post_frames = 25L
+  game_id_sel, play_id_sel,
+  out_path = NULL,
+  fps = 12,
+  pre_frames = 6L,
+  post_frames = 25L
 ) {
   game_id_sel <- as.character(game_id_sel)
   play_id_sel <- as.character(play_id_sel)
-  
+
   stopifnot(exists("core"), !is.null(core$all_frames))
   stopifnot(exists("inputs_all"))
   stopifnot(exists("outputs_all"))
   stopifnot(exists("cd_frame_probs"))
-  
+
   all_frames <- core$all_frames %>%
     dplyr::mutate(
       game_id = as.character(game_id),
       play_id = as.character(play_id),
       nfl_id  = as.character(nfl_id)
     )
-  
+
   inputs_all2 <- inputs_all %>%
     dplyr::mutate(
       game_id = as.character(game_id),
       play_id = as.character(play_id),
       nfl_id  = as.character(nfl_id)
     )
-  
+
   outputs_all2 <- outputs_all %>%
     dplyr::mutate(
       game_id = as.character(game_id),
       play_id = as.character(play_id),
       nfl_id  = as.character(nfl_id)
     )
-  
+
   probs_all2 <- cd_frame_probs %>%
     dplyr::mutate(
       game_id = as.character(game_id),
       play_id = as.character(play_id),
       nfl_id  = as.character(nfl_id)
     )
-  
+
   inputs_play <- inputs_all2 %>%
     dplyr::filter(game_id == game_id_sel, play_id == play_id_sel)
-  
+
   if (!nrow(inputs_play)) stop("No rows in inputs_all for this (game_id, play_id).")
-  
+
   throw_frame <- max(inputs_play$frame_id, na.rm = TRUE)
   min_frame   <- max(1L, as.integer(throw_frame - pre_frames))
   max_frame   <- as.integer(throw_frame + post_frames)
-  
+
+  frame_seq <- min_frame:max_frame
+
   play_data <- all_frames %>%
-    dplyr::filter(game_id == game_id_sel, play_id == play_id_sel, frame_id >= min_frame, frame_id <= throw_frame) %>%
+    dplyr::filter(
+      game_id == game_id_sel,
+      play_id == play_id_sel,
+      frame_id >= min_frame,
+      frame_id <= throw_frame
+    ) %>%
     dplyr::arrange(frame_id, nfl_id)
-  
+
   if (!nrow(play_data)) stop("No tracking frames found for this play in core$all_frames.")
-  
+
   role_colors <- c(
     "Passer"             = "orange",
     "Targeted Receiver"  = "red",
@@ -84,7 +91,7 @@ animate_play_pobe <- function(
     "Defensive Coverage" = "blue",
     "Football"           = "#815337"
   )
-  
+
   play_data <- play_data %>%
     dplyr::mutate(
       role_color = role_colors[player_role],
@@ -93,109 +100,113 @@ animate_play_pobe <- function(
       a   = dplyr::coalesce(a, 0),
       dir = dplyr::coalesce(dir, 0)
     )
-  
+
   all_frames_in_play <- play_data %>%
     dplyr::group_by(nfl_id) %>%
-    tidyr::complete(frame_id = 1:max_frame) %>%
+    tidyr::complete(frame_id = frame_seq) %>%
     dplyr::arrange(frame_id, .by_group = TRUE) %>%
     tidyr::fill(
       x, y, role_color, shape_val, player_side, player_role, player_name, player_position, s, a, dir, o,
-      .direction = "down"
+      .direction = "downup"
     ) %>%
     dplyr::ungroup()
-  
+
   qb_id <- play_data %>%
     dplyr::filter(player_role == "Passer", player_side == "Offense") %>%
     dplyr::slice_head(n = 1) %>%
     dplyr::pull(nfl_id)
-  
+
   if (!length(qb_id) || is.na(qb_id)) {
-    qb_id <- play_data %>% dplyr::filter(player_side == "Offense") %>% dplyr::slice_head(n = 1) %>% dplyr::pull(nfl_id)
+    qb_id <- play_data %>%
+      dplyr::filter(player_side == "Offense") %>%
+      dplyr::slice_head(n = 1) %>%
+      dplyr::pull(nfl_id)
   }
   qb_id <- as.character(qb_id)
-  
+
   qb_frames <- all_frames_in_play %>%
     dplyr::filter(nfl_id == qb_id) %>%
     dplyr::select(frame_id, qb_x = x, qb_y = y)
-  
+
   release_loc <- qb_frames %>%
     dplyr::filter(frame_id == throw_frame) %>%
     dplyr::slice_head(n = 1)
-  
+
   if (!nrow(release_loc)) stop("Could not find QB at throw_frame.")
-  
+
   release_x <- release_loc$qb_x[[1]]
   release_y <- release_loc$qb_y[[1]]
-  
+
   land_x <- inputs_play$ball_land_x[!is.na(inputs_play$ball_land_x)][1]
   land_y <- inputs_play$ball_land_y[!is.na(inputs_play$ball_land_y)][1]
   if (is.na(land_x) || is.na(land_y)) stop("Missing ball_land_x/ball_land_y in inputs for this play.")
-  
+
   n_post_frames <- max_frame - throw_frame
-  
+
   ball_pre <- qb_frames %>%
-    dplyr::filter(frame_id < throw_frame) %>%
+    dplyr::filter(frame_id >= min_frame, frame_id < throw_frame) %>%
     dplyr::transmute(frame_id, ball_x = qb_x, ball_y = qb_y)
-  
+
   ball_post <- tibble::tibble(
     frame_id = throw_frame:max_frame,
     ball_x   = seq(release_x, land_x, length.out = n_post_frames + 1),
     ball_y   = seq(release_y, land_y, length.out = n_post_frames + 1)
   )
-  
+
   ball_trajectory <- dplyr::bind_rows(ball_pre, ball_post) %>%
+    dplyr::filter(frame_id %in% frame_seq) %>%
     dplyr::arrange(frame_id)
-  
+
   pre_at_throw <- inputs_play %>%
     dplyr::filter(frame_id == throw_frame) %>%
     dplyr::mutate(nfl_id = as.character(nfl_id))
-  
+
   post_last <- outputs_all2 %>%
     dplyr::filter(game_id == game_id_sel, play_id == play_id_sel) %>%
     dplyr::group_by(nfl_id) %>%
     dplyr::slice_max(frame_id, n = 1, with_ties = FALSE) %>%
     dplyr::ungroup() %>%
     dplyr::transmute(nfl_id, x1 = x, y1 = y)
-  
+
   rec_row <- pre_at_throw %>%
     dplyr::filter(player_role == "Targeted Receiver") %>%
     dplyr::slice_head(n = 1)
-  
+
   if (!nrow(rec_row)) stop("No Targeted Receiver at throw_frame for this play.")
-  
+
   rec_id <- as.character(rec_row$nfl_id[[1]])
   rec_x0 <- rec_row$x[[1]]
   rec_y0 <- rec_row$y[[1]]
-  
+
   def_row <- pre_at_throw %>%
     dplyr::filter(player_side == "Defense") %>%
     dplyr::mutate(dist_to_rec = sqrt((x - rec_x0)^2 + (y - rec_y0)^2)) %>%
     dplyr::slice_min(dist_to_rec, n = 1, with_ties = FALSE)
-  
+
   if (!nrow(def_row)) stop("No defender at throw_frame for this play.")
-  
+
   def_id <- as.character(def_row$nfl_id[[1]])
   def_x0 <- def_row$x[[1]]
   def_y0 <- def_row$y[[1]]
-  
+
   rec_post <- post_last %>% dplyr::filter(nfl_id == rec_id) %>% dplyr::slice_head(n = 1)
   def_post <- post_last %>% dplyr::filter(nfl_id == def_id) %>% dplyr::slice_head(n = 1)
-  
+
   if (!nrow(rec_post)) stop("Receiver not found in outputs (no after-pass endpoint).")
   if (!nrow(def_post)) stop("Defender not found in outputs (no after-pass endpoint).")
-  
+
   all_frames_in_play <- all_frames_in_play %>%
     interp_xy(rec_id, rec_x0, rec_y0, rec_post$x1[[1]], rec_post$y1[[1]], throw_frame, max_frame) %>%
     interp_xy(def_id, def_x0, def_y0, def_post$x1[[1]], def_post$y1[[1]], throw_frame, max_frame)
-  
+
   targeted_receiver <- all_frames_in_play %>%
     dplyr::filter(player_role == "Targeted Receiver")
-  
+
   primary_defender <- probs_all2 %>%
     dplyr::filter(game_id == game_id_sel, play_id == play_id_sel, frame_id == throw_frame) %>%
     dplyr::arrange(dplyr::desc(prob_reach_frame_xgb), nfl_id) %>%
     dplyr::slice_head(n = 1)
-  
+
   if (!nrow(primary_defender)) {
     primary_defender <- probs_all2 %>%
       dplyr::filter(game_id == game_id_sel, play_id == play_id_sel) %>%
@@ -203,9 +214,9 @@ animate_play_pobe <- function(
       dplyr::slice_head(n = 1)
   }
   if (!nrow(primary_defender)) stop("No defender probs found for this play.")
-  
+
   cd_id <- as.character(primary_defender$nfl_id[[1]])
-  
+
   cd_name <- {
     nm <- all_frames_in_play %>%
       dplyr::filter(nfl_id == cd_id) %>%
@@ -213,47 +224,49 @@ animate_play_pobe <- function(
       dplyr::pull(nm)
     if (length(nm) && !is.na(nm)) nm else cd_id
   }
-  
+
   all_frames_in_play <- all_frames_in_play %>%
     dplyr::mutate(role_color = dplyr::if_else(nfl_id == cd_id, "purple", role_color))
-  
+
   cd_labels <- all_frames_in_play %>%
     dplyr::filter(nfl_id == cd_id) %>%
     dplyr::group_by(frame_id) %>% dplyr::slice_head(n = 1) %>% dplyr::ungroup() %>%
     dplyr::mutate(label = cd_name)
-  
+
   cd_frame_prob <- probs_all2 %>%
     dplyr::filter(game_id == game_id_sel, play_id == play_id_sel, nfl_id == cd_id) %>%
     dplyr::arrange(frame_id) %>%
     dplyr::select(frame_id, prob_reach_frame_xgb) %>%
     dplyr::rename(prob_reach_frame = prob_reach_frame_xgb)
-  
-  prob_label_data <- tibble::tibble(frame_id = 1:max_frame) %>%
+
+  prob_label_data <- tibble::tibble(frame_id = frame_seq) %>%
     dplyr::left_join(cd_frame_prob, by = "frame_id") %>%
     dplyr::arrange(frame_id) %>%
     tidyr::fill(prob_reach_frame, .direction = "down") %>%
     dplyr::mutate(
+      prob_show = dplyr::if_else(frame_id < throw_frame, NA_real_, prob_reach_frame),
       x = 5, y = 53,
       label = dplyr::if_else(
-        is.na(prob_reach_frame),
+        is.na(prob_show),
         "P(reach \u2264 2 yds): NA",
-        paste0("P(reach \u2264 2 yds) = ", scales::percent(prob_reach_frame, accuracy = 0.1))
+        paste0("P(reach \u2264 2 yds) = ", scales::percent(prob_show, accuracy = 0.1))
       )
-    )
-  
+    ) %>%
+    dplyr::select(-prob_show)
+
   cd_prob_at_throw <- cd_frame_prob %>%
     dplyr::filter(frame_id == throw_frame) %>%
     dplyr::slice_head(n = 1) %>%
     dplyr::pull(prob_reach_frame)
-  
+
   prob_text <- if (!is.na(cd_prob_at_throw)) {
     paste0("XGBoost P(reach \u2264 2 yds at throw) = ", scales::percent(cd_prob_at_throw, accuracy = 0.1))
   } else {
     "XGBoost probability unavailable at throw"
   }
-  
+
   play_desc <- paste0("game_id=", game_id_sel, " play_id=", play_id_sel)
-  
+
   p <- draw_field() +
     ggplot2::geom_point(
       data = all_frames_in_play,
@@ -287,7 +300,7 @@ animate_play_pobe <- function(
     ggplot2::scale_color_identity() +
     ggplot2::scale_shape_manual(values = c("16" = 16, "17" = 17), guide = "none") +
     ggplot2::labs(
-      title = paste0(play_desc, " | Frame: {current_frame}"),
+      title = paste0(play_desc, " | Frame: {current_frame} (rel: {current_frame}-", throw_frame, ")"),
       subtitle = prob_text
     ) +
     ggplot2::theme(
@@ -295,19 +308,20 @@ animate_play_pobe <- function(
       plot.subtitle = ggplot2::element_text(hjust = 0.5, size = 9)
     ) +
     gganimate::transition_manual(frame_id)
-  
+
   anim <- gganimate::animate(
     p, fps = fps, width = 1700, height = 900, res = 200,
     renderer = gganimate::gifski_renderer(loop = TRUE)
   )
-  
+
   if (!is.null(out_path)) {
     out_path <- ensure_out_dir(out_path)
     gganimate::anim_save(filename = out_path, animation = anim)
   }
-  
+
   return(anim)
 }
+
 stopifnot(exists("core"), !is.null(core$all_frames))
 stopifnot(exists("inputs_all"), exists("outputs_all"))
 stopifnot(exists("cd_frame_probs"))
@@ -321,54 +335,15 @@ game_id_test <- "2023110505"
 play_id_test <- "1540"
 
 cat("\n--- PLAY EXISTS? (inputs) ---\n")
-print(inputs_all %>% filter(game_id == game_id_test, play_id == play_id_test) %>% summarise(n=n(), max_frame=max(frame_id)))
+print(inputs_all %>% dplyr::filter(game_id == game_id_test, play_id == play_id_test) %>% dplyr::summarise(n=dplyr::n(), max_frame=max(frame_id)))
 
 cat("\n--- HAVE AFTER-PASS ENDPOINTS? (outputs) ---\n")
 print(outputs_all %>%
-  filter(game_id == game_id_test, play_id == play_id_test) %>%
-  group_by(nfl_id) %>%
-  summarise(n=n(), max_frame=max(frame_id), .groups="drop") %>%
-  summarise(n_players=n(), min_max_frame=min(max_frame), max_max_frame=max(max_frame)))
+  dplyr::filter(game_id == game_id_test, play_id == play_id_test) %>%
+  dplyr::group_by(nfl_id) %>%
+  dplyr::summarise(n=dplyr::n(), max_frame=max(frame_id), .groups="drop") %>%
+  dplyr::summarise(n_players=dplyr::n(), min_max_frame=min(max_frame), max_max_frame=max(max_frame)))
 
 cat("\n--- RUN ANIMATION (exports gif) ---\n")
 anim <- animate_play_pobe(game_id_test, play_id_test, out_path = "viz/test_play.gif", fps = 12)
-
 anim
-game_id_sel <- "2023110505"
-play_id_sel <- "1540"
-
-inputs_play <- inputs_all %>% filter(game_id == game_id_sel, play_id == play_id_sel)
-throw_frame <- max(inputs_play$frame_id, na.rm = TRUE)
-max_frame   <- throw_frame + 25L
-
-pre_at_throw <- inputs_play %>%
-  filter(frame_id == throw_frame) %>%
-  mutate(nfl_id = as.character(nfl_id))
-
-rec_row <- pre_at_throw %>% filter(player_role == "Targeted Receiver") %>% slice_head(n=1)
-stopifnot(nrow(rec_row) == 1)
-
-rec_id <- as.character(rec_row$nfl_id[[1]])
-rec_x0 <- rec_row$x[[1]]
-rec_y0 <- rec_row$y[[1]]
-
-def_row <- pre_at_throw %>%
-  filter(player_side == "Defense") %>%
-  mutate(dist_to_rec = sqrt((x - rec_x0)^2 + (y - rec_y0)^2)) %>%
-  slice_min(dist_to_rec, n = 1, with_ties = FALSE)
-stopifnot(nrow(def_row) == 1)
-
-def_id <- as.character(def_row$nfl_id[[1]])
-
-cat("\nReceiver id:", rec_id, " | Closest def id:", def_id, "\n")
-cat("Throw frame:", throw_frame, " Max frame:", max_frame, "\n")
-
-cat("\n--- Receiver post-throw endpoint exists? ---\n")
-print(outputs_all %>%
-  filter(game_id == game_id_sel, play_id == play_id_sel, nfl_id == rec_id) %>%
-  summarise(n=n(), max_frame=max(frame_id)))
-
-cat("\n--- Defender post-throw endpoint exists? ---\n")
-print(outputs_all %>%
-  filter(game_id == game_id_sel, play_id == play_id_sel, nfl_id == def_id) %>%
-  summarise(n=n(), max_frame=max(frame_id)))
